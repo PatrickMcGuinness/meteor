@@ -66,7 +66,8 @@ var log_callbacks = function (operations) {
 // XXX test shared structure in all MM entrypoints
 Tinytest.add("minimongo - basics", function (test) {
   var c = new LocalCollection(),
-      fluffyKitten_id;
+      fluffyKitten_id,
+      count;
 
   fluffyKitten_id = c.insert({type: "kitten", name: "fluffy"});
   c.insert({type: "kitten", name: "snookums"});
@@ -87,7 +88,8 @@ Tinytest.add("minimongo - basics", function (test) {
   test.length(c.find({type: "kitten"}).fetch(), 2);
   test.length(c.find({type: "cryptographer"}).fetch(), 2);
 
-  c.update({name: "snookums"}, {$set: {type: "cryptographer"}});
+  count = c.update({name: "snookums"}, {$set: {type: "cryptographer"}});
+  test.equal(count, 1);
   test.equal(c.find().count(), 4);
   test.equal(c.find({type: "kitten"}).count(), 1);
   test.equal(c.find({type: "cryptographer"}).count(), 3);
@@ -102,10 +104,12 @@ Tinytest.add("minimongo - basics", function (test) {
   c.remove({_id: null});
   c.remove({_id: false});
   c.remove({_id: undefined});
-  c.remove();
+  count = c.remove();
+  test.equal(count, 0);
   test.equal(c.find().count(), 4);
 
-  c.remove({});
+  count = c.remove({});
+  test.equal(count, 4);
   test.equal(c.find().count(), 0);
 
   c.insert({_id: 1, name: "strawberry", tags: ["fruit", "red", "squishy"]});
@@ -172,35 +176,58 @@ Tinytest.add("minimongo - cursors", function (test) {
   // fetch
   res = q.fetch();
   test.length(res, 20);
-  for (var i = 0; i < 20; i++)
+  for (var i = 0; i < 20; i++) {
     test.equal(res[i].i, i);
-  // everything empty
-  test.length(q.fetch(), 0);
-  q.rewind();
+  }
+  // call it again, it still works
+  test.length(q.fetch(), 20);
 
   // forEach
   var count = 0;
-  q.forEach(function (obj) {
+  var context = {};
+  q.forEach(function (obj, i, cursor) {
     test.equal(obj.i, count++);
-  });
+    test.equal(obj.i, i);
+    test.isTrue(context === this);
+    test.isTrue(cursor === q);
+  }, context);
   test.equal(count, 20);
-  // everything empty
-  test.length(q.fetch(), 0);
-  q.rewind();
+  // call it again, it still works
+  test.length(q.fetch(), 20);
 
   // map
-  res = q.map(function (obj) { return obj.i * 2; });
+  res = q.map(function (obj, i, cursor) {
+    test.equal(obj.i, i);
+    test.isTrue(context === this);
+    test.isTrue(cursor === q);
+    return obj.i * 2;
+  }, context);
   test.length(res, 20);
   for (var i = 0; i < 20; i++)
     test.equal(res[i], i * 2);
-  // everything empty
-  test.length(q.fetch(), 0);
+  // call it again, it still works
+  test.length(q.fetch(), 20);
 
   // findOne (and no rewind first)
   test.equal(c.findOne({i: 0}).i, 0);
   test.equal(c.findOne({i: 1}).i, 1);
   var id = c.findOne({i: 2})._id;
   test.equal(c.findOne(id).i, 2);
+});
+
+Tinytest.add("minimongo - transform", function (test) {
+  var c = new LocalCollection;
+  c.insert({});
+  // transform functions must return objects
+  var invalidTransform = function (doc) { return doc._id; };
+  test.throws(function () {
+    c.findOne({}, {transform: invalidTransform});
+  });
+
+  // transformed documents get _id field transplanted if not present
+  var transformWithoutId = function (doc) { return _.omit(doc, '_id'); };
+  test.equal(c.findOne({}, {transform: transformWithoutId})._id,
+             c.findOne()._id);
 });
 
 Tinytest.add("minimongo - misc", function (test) {
@@ -230,33 +257,59 @@ Tinytest.add("minimongo - misc", function (test) {
 });
 
 Tinytest.add("minimongo - lookup", function (test) {
-  var lookupA = LocalCollection._makeLookupFunction('a');
-  test.equal(lookupA({}), [undefined]);
-  test.equal(lookupA({a: 1}), [1]);
-  test.equal(lookupA({a: [1]}), [[1]]);
+  var lookupA = MinimongoTest.makeLookupFunction('a');
+  test.equal(lookupA({}), [{value: undefined}]);
+  test.equal(lookupA({a: 1}), [{value: 1}]);
+  test.equal(lookupA({a: [1]}), [{value: [1]}]);
 
-  var lookupAX = LocalCollection._makeLookupFunction('a.x');
-  test.equal(lookupAX({a: {x: 1}}), [1]);
-  test.equal(lookupAX({a: {x: [1]}}), [[1]]);
-  test.equal(lookupAX({a: 5}), [undefined]);
+  var lookupAX = MinimongoTest.makeLookupFunction('a.x');
+  test.equal(lookupAX({a: {x: 1}}), [{value: 1}]);
+  test.equal(lookupAX({a: {x: [1]}}), [{value: [1]}]);
+  test.equal(lookupAX({a: 5}), [{value: undefined}]);
   test.equal(lookupAX({a: [{x: 1}, {x: [2]}, {y: 3}]}),
-             [1, [2], undefined]);
+             [{value: 1, arrayIndices: [0]},
+              {value: [2], arrayIndices: [1]},
+              {value: undefined, arrayIndices: [2]}]);
 
-  var lookupA0X = LocalCollection._makeLookupFunction('a.0.x');
-  test.equal(lookupA0X({a: [{x: 1}]}), [1]);
-  test.equal(lookupA0X({a: [{x: [1]}]}), [[1]]);
-  test.equal(lookupA0X({a: 5}), [undefined]);
-  test.equal(lookupA0X({a: [{x: 1}, {x: [2]}, {y: 3}]}), [1]);
+  var lookupA0X = MinimongoTest.makeLookupFunction('a.0.x');
+  test.equal(lookupA0X({a: [{x: 1}]}), [
+    // From interpreting '0' as "0th array element".
+    {value: 1, arrayIndices: [0, 'x']},
+    // From interpreting '0' as "after branching in the array, look in the
+    // object {x:1} for a field named 0".
+    {value: undefined, arrayIndices: [0]}]);
+  test.equal(lookupA0X({a: [{x: [1]}]}), [
+    {value: [1], arrayIndices: [0, 'x']},
+    {value: undefined, arrayIndices: [0]}]);
+  test.equal(lookupA0X({a: 5}), [{value: undefined}]);
+  test.equal(lookupA0X({a: [{x: 1}, {x: [2]}, {y: 3}]}), [
+    // From interpreting '0' as "0th array element".
+    {value: 1, arrayIndices: [0, 'x']},
+    // From interpreting '0' as "after branching in the array, look in the
+    // object {x:1} for a field named 0".
+    {value: undefined, arrayIndices: [0]},
+    {value: undefined, arrayIndices: [1]},
+    {value: undefined, arrayIndices: [2]}
+  ]);
+
+  test.equal(
+    MinimongoTest.makeLookupFunction('w.x.0.z')({
+      w: [{x: [{z: 5}]}]}), [
+        // From interpreting '0' as "0th array element".
+        {value: 5, arrayIndices: [0, 0, 'x']},
+        // From interpreting '0' as "after branching in the array, look in the
+        // object {z:5} for a field named "0".
+        {value: undefined, arrayIndices: [0, 0]}
+      ]);
 });
 
 Tinytest.add("minimongo - selector_compiler", function (test) {
-  var matches = function (should_match, selector, doc) {
-    var does_match = LocalCollection._matches(selector, doc);
-    if (does_match != should_match) {
+  var matches = function (shouldMatch, selector, doc) {
+    var doesMatch = new Minimongo.Matcher(selector).documentMatches(doc).result;
+    if (doesMatch != shouldMatch) {
       // XXX super janky
-      test.fail({type: "minimongo-ordering",
-                 message: "minimongo match failure: document " +
-                 (should_match ? "should match, but doesn't" :
+      test.fail({message: "minimongo match failure: document " +
+                 (shouldMatch ? "should match, but doesn't" :
                   "shouldn't match, but does"),
                  selector: JSON.stringify(selector),
                  document: JSON.stringify(doc)
@@ -303,6 +356,13 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   nomatch({a: 12}, {a: [11, 13]});
   match({a: 12, b: 13}, {a: [11, 12, 13], b: [13, 14, 15]});
   nomatch({a: 12, b: 13}, {a: [11, 12, 13], b: [14, 15]});
+
+  // dates
+  var date1 = new Date;
+  var date2 = new Date(date1.getTime() + 1000);
+  match({a: date1}, {a: date1});
+  nomatch({a: date1}, {a: date2});
+
 
   // arrays
   match({a: [1,2]}, {a: [1, 2]});
@@ -359,7 +419,7 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   nomatch({a: {$lt: 10}}, {a: [11, 12]});
 
   // (there's a full suite of ordering test elsewhere)
-  match({a: {$lt: "null"}}, {a: null}); // tested against mongodb
+  nomatch({a: {$lt: "null"}}, {a: null});
   match({a: {$lt: {x: [2, 3, 4]}}}, {a: {x: [1, 3, 4]}});
   match({a: {$gt: {x: [2, 3, 4]}}}, {a: {x: [3, 3, 4]}});
   nomatch({a: {$gt: {x: [2, 3, 4]}}}, {a: {x: [1, 3, 4]}});
@@ -395,6 +455,17 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   nomatch({a: {$all: [1, 2]}}, {a: [[1, 2]]}); // tested against mongodb
   nomatch({a: {$all: [1, 2]}}, {}); // tested against mongodb, field doesn't exist
   nomatch({a: {$all: [1, 2]}}, {a: {foo: 'bar'}}); // tested against mongodb, field is not an object
+  nomatch({a: {$all: []}}, {a: []});
+  nomatch({a: {$all: []}}, {a: [5]});
+  match({a: {$all: [/i/, /e/i]}}, {a: ["foo", "bEr", "biz"]});
+  nomatch({a: {$all: [/i/, /e/i]}}, {a: ["foo", "bar", "biz"]});
+  match({a: {$all: [{b: 3}]}}, {a: [{b: 3}]});
+  // Members of $all other than regexps are *equality matches*, not document
+  // matches.
+  nomatch({a: {$all: [{b: 3}]}}, {a: [{b: 3, k: 4}]});
+  test.throws(function () {
+    match({a: {$all: [{$gt: 4}]}}, {});
+  });
 
   // $exists
   match({a: {$exists: true}}, {a: 12});
@@ -412,11 +483,32 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   nomatch({a: {$exists: false}}, {a: [1]});
   match({a: {$exists: false}}, {b: [1]});
 
+  match({a: {$exists: 1}}, {a: 5});
+  match({a: {$exists: 0}}, {b: 5});
+
+  nomatch({'a.x':{$exists: false}}, {a: [{}, {x: 5}]});
+  match({'a.x':{$exists: true}}, {a: [{}, {x: 5}]});
+  match({'a.x':{$exists: true}}, {a: [{}, {x: 5}]});
+  match({'a.x':{$exists: true}}, {a: {x: []}});
+  match({'a.x':{$exists: true}}, {a: {x: null}});
+
   // $mod
   match({a: {$mod: [10, 1]}}, {a: 11});
   nomatch({a: {$mod: [10, 1]}}, {a: 12});
   match({a: {$mod: [10, 1]}}, {a: [10, 11, 12]});
   nomatch({a: {$mod: [10, 1]}}, {a: [10, 12]});
+  _.each([
+    5,
+    [10],
+    [10, 1, 2],
+    "foo",
+    {bar: 1},
+    []
+  ], function (badMod) {
+    test.throws(function () {
+      match({a: {$mod: badMod}}, {a: 11});
+    });
+  });
 
   // $ne
   match({a: {$ne: 1}}, {a: 2});
@@ -427,10 +519,24 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   nomatch({a: {$ne: 1}}, {a: [1, 2]});
   nomatch({a: {$ne: 2}}, {a: [1, 2]});
   match({a: {$ne: 3}}, {a: [1, 2]});
+  nomatch({'a.b': {$ne: 1}}, {a: [{b: 1}, {b: 2}]});
+  nomatch({'a.b': {$ne: 2}}, {a: [{b: 1}, {b: 2}]});
+  match({'a.b': {$ne: 3}}, {a: [{b: 1}, {b: 2}]});
 
   nomatch({a: {$ne: {x: 1}}}, {a: {x: 1}});
   match({a: {$ne: {x: 1}}}, {a: {x: 2}});
   match({a: {$ne: {x: 1}}}, {a: {x: 1, y: 2}});
+
+  // This query means: All 'a.b' must be non-5, and some 'a.b' must be >6.
+  match({'a.b': {$ne: 5, $gt: 6}}, {a: [{b: 2}, {b: 10}]});
+  nomatch({'a.b': {$ne: 5, $gt: 6}}, {a: [{b: 2}, {b: 4}]});
+  nomatch({'a.b': {$ne: 5, $gt: 6}}, {a: [{b: 2}, {b: 5}]});
+  nomatch({'a.b': {$ne: 5, $gt: 6}}, {a: [{b: 10}, {b: 5}]});
+  // Should work the same if the branch is at the bottom.
+  match({a: {$ne: 5, $gt: 6}}, {a: [2, 10]});
+  nomatch({a: {$ne: 5, $gt: 6}}, {a: [2, 4]});
+  nomatch({a: {$ne: 5, $gt: 6}}, {a: [2, 5]});
+  nomatch({a: {$ne: 5, $gt: 6}}, {a: [10, 5]});
 
   // $in
   match({a: {$in: [1, 2, 3]}}, {a: 2});
@@ -445,6 +551,23 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   match({a: {$in: [1, 2, 3]}}, {a: [4, 2]});
   nomatch({a: {$in: [1, 2, 3]}}, {a: [4]});
 
+  match({a: {$in: ['x', /foo/i]}}, {a: 'x'});
+  match({a: {$in: ['x', /foo/i]}}, {a: 'fOo'});
+  match({a: {$in: ['x', /foo/i]}}, {a: ['f', 'fOo']});
+  nomatch({a: {$in: ['x', /foo/i]}}, {a: ['f', 'fOx']});
+
+  match({a: {$in: [1, null]}}, {});
+  match({'a.b': {$in: [1, null]}}, {});
+  match({'a.b': {$in: [1, null]}}, {a: {}});
+  match({'a.b': {$in: [1, null]}}, {a: {b: null}});
+  nomatch({'a.b': {$in: [1, null]}}, {a: {b: 5}});
+  nomatch({'a.b': {$in: [1]}}, {a: {b: null}});
+  nomatch({'a.b': {$in: [1]}}, {a: {}});
+  nomatch({'a.b': {$in: [1, null]}}, {a: [{b: 5}]});
+  match({'a.b': {$in: [1, null]}}, {a: [{b: 5}, {}]});
+  nomatch({'a.b': {$in: [1, null]}}, {a: [{b: 5}, []]});
+  nomatch({'a.b': {$in: [1, null]}}, {a: [{b: 5}, 5]});
+
   // $nin
   nomatch({a: {$nin: [1, 2, 3]}}, {a: 2});
   match({a: {$nin: [1, 2, 3]}}, {a: 4});
@@ -456,7 +579,26 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   nomatch({a: {$nin: [1, 2, 3]}}, {a: [2]}); // tested against mongodb
   nomatch({a: {$nin: [{x: 1}, {x: 2}, {x: 3}]}}, {a: [{x: 2}]});
   nomatch({a: {$nin: [1, 2, 3]}}, {a: [4, 2]});
+  nomatch({'a.b': {$nin: [1, 2, 3]}}, {a: [{b:4}, {b:2}]});
   match({a: {$nin: [1, 2, 3]}}, {a: [4]});
+  match({'a.b': {$nin: [1, 2, 3]}}, {a: [{b:4}]});
+
+  nomatch({a: {$nin: ['x', /foo/i]}}, {a: 'x'});
+  nomatch({a: {$nin: ['x', /foo/i]}}, {a: 'fOo'});
+  nomatch({a: {$nin: ['x', /foo/i]}}, {a: ['f', 'fOo']});
+  match({a: {$nin: ['x', /foo/i]}}, {a: ['f', 'fOx']});
+
+  nomatch({a: {$nin: [1, null]}}, {});
+  nomatch({'a.b': {$nin: [1, null]}}, {});
+  nomatch({'a.b': {$nin: [1, null]}}, {a: {}});
+  nomatch({'a.b': {$nin: [1, null]}}, {a: {b: null}});
+  match({'a.b': {$nin: [1, null]}}, {a: {b: 5}});
+  match({'a.b': {$nin: [1]}}, {a: {b: null}});
+  match({'a.b': {$nin: [1]}}, {a: {}});
+  match({'a.b': {$nin: [1, null]}}, {a: [{b: 5}]});
+  nomatch({'a.b': {$nin: [1, null]}}, {a: [{b: 5}, {}]});
+  match({'a.b': {$nin: [1, null]}}, {a: [{b: 5}, []]});
+  match({'a.b': {$nin: [1, null]}}, {a: [{b: 5}, 5]});
 
   // $size
   match({a: {$size: 0}}, {a: []});
@@ -486,7 +628,7 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   match({a: {$type: 5}}, {a: EJSON.newBinary(4)});
   nomatch({a: {$type: 5}}, {a: []});
   nomatch({a: {$type: 5}}, {a: [42]});
-  match({a: {$type: 7}}, {a: new LocalCollection._ObjectID()});
+  match({a: {$type: 7}}, {a: new MongoID.ObjectID()});
   nomatch({a: {$type: 7}}, {a: "1234567890abcd1234567890"});
   match({a: {$type: 8}}, {a: true});
   match({a: {$type: 8}}, {a: false});
@@ -506,6 +648,9 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   nomatch({a: {$type: 11}}, {a: 'x'});
   nomatch({a: {$type: 11}}, {});
 
+  // The normal rule for {$type:4} (4 means array) is that it NOT good enough to
+  // just have an array that's the leaf that matches the path.  (An array inside
+  // that array is good, though.)
   nomatch({a: {$type: 4}}, {a: []});
   nomatch({a: {$type: 4}}, {a: [1]}); // tested against mongodb
   match({a: {$type: 1}}, {a: [1]});
@@ -517,6 +662,10 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   nomatch({a: {$type: 1}}, {a: ["1", []]});
   match({a: {$type: 2}}, {a: ["1", []]});
   match({a: {$type: 4}}, {a: ["1", []]}); // tested against mongodb
+  // An exception to the normal rule is that an array found via numeric index is
+  // examined itself, and its elements are not.
+  match({'a.0': {$type: 4}}, {a: [[0]]});
+  nomatch({'a.0': {$type: 1}}, {a: [[0]]});
 
   // regular expressions
   match({a: /a/}, {a: 'cat'});
@@ -538,16 +687,44 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   nomatch({a: {$regex: 'a'}}, {a: 'cut'});
   nomatch({a: {$regex: 'a'}}, {a: 'CAT'});
   match({a: {$regex: 'a', $options: 'i'}}, {a: 'CAT'});
+  match({a: {$regex: '', $options: 'i'}}, {a: 'foo'});
+  nomatch({a: {$regex: '', $options: 'i'}}, {});
+  nomatch({a: {$regex: '', $options: 'i'}}, {a: 5});
   nomatch({a: /undefined/}, {});
   nomatch({a: {$regex: 'undefined'}}, {});
   nomatch({a: /xxx/}, {});
   nomatch({a: {$regex: 'xxx'}}, {});
 
-  match({a: {$options: 'i'}}, {a: 12});
-  match({b: {$options: 'i'}}, {a: 12});
+  // GitHub issue #2817:
+  // Regexps with a global flag ('g') keep a state when tested against the same
+  // string. Selector shouldn't return different result for similar documents
+  // because of this state.
+  var reusedRegexp = /sh/ig;
+  match({a: reusedRegexp}, {a: 'Shorts'});
+  match({a: reusedRegexp}, {a: 'Shorts'});
+  match({a: reusedRegexp}, {a: 'Shorts'});
+
+  match({a: {$regex: reusedRegexp}}, {a: 'Shorts'});
+  match({a: {$regex: reusedRegexp}}, {a: 'Shorts'});
+  match({a: {$regex: reusedRegexp}}, {a: 'Shorts'});
+
+  test.throws(function () {
+    match({a: {$options: 'i'}}, {a: 12});
+  });
 
   match({a: /a/}, {a: ['dog', 'cat']});
   nomatch({a: /a/}, {a: ['dog', 'puppy']});
+
+  // we don't support regexps in minimongo very well (eg, there's no EJSON
+  // encoding so it won't go over the wire), but run these tests anyway
+  match({a: /a/}, {a: /a/});
+  match({a: /a/}, {a: ['x', /a/]});
+  nomatch({a: /a/}, {a: /a/i});
+  nomatch({a: /a/m}, {a: /a/});
+  nomatch({a: /a/}, {a: /b/});
+  nomatch({a: /5/}, {a: 5});
+  nomatch({a: /t/}, {a: true});
+  match({a: /m/i}, {a: ['x', 'xM']});
 
   test.throws(function () {
     match({a: {$regex: /a/, $options: 'x'}}, {a: 'cat'});
@@ -564,7 +741,9 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   match({x: {$not: {$lt: 10, $gt: 7}}}, {x: 6});
 
   match({x: {$not: {$gt: 7}}}, {x: [2, 3, 4]});
+  match({'x.y': {$not: {$gt: 7}}}, {x: [{y:2}, {y:3}, {y:4}]});
   nomatch({x: {$not: {$gt: 7}}}, {x: [2, 3, 4, 10]});
+  nomatch({'x.y': {$not: {$gt: 7}}}, {x: [{y:2}, {y:3}, {y:4}, {y:10}]});
 
   match({x: {$not: /a/}}, {x: "dog"});
   nomatch({x: {$not: /a/}}, {x: "cat"});
@@ -580,7 +759,44 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   nomatch({"a.b": /a/}, {a: {b: "dog"}});
   match({"a.b.c": null}, {});
   match({"a.b.c": null}, {a: 1});
+  match({"a.b": null}, {a: 1});
   match({"a.b.c": null}, {a: {b: 4}});
+
+  // dotted keypaths, nulls, numeric indices, arrays
+  nomatch({"a.b": null}, {a: [1]});
+  match({"a.b": []}, {a: {b: []}});
+  var big = {a: [{b: 1}, 2, {}, {b: [3, 4]}]};
+  match({"a.b": 1}, big);
+  match({"a.b": [3, 4]}, big);
+  match({"a.b": 3}, big);
+  match({"a.b": 4}, big);
+  match({"a.b": null}, big);  // matches on slot 2
+  match({'a.1': 8}, {a: [7, 8, 9]});
+  nomatch({'a.1': 7}, {a: [7, 8, 9]});
+  nomatch({'a.1': null}, {a: [7, 8, 9]});
+  match({'a.1': [8, 9]}, {a: [7, [8, 9]]});
+  nomatch({'a.1': 6}, {a: [[6, 7], [8, 9]]});
+  nomatch({'a.1': 7}, {a: [[6, 7], [8, 9]]});
+  nomatch({'a.1': 8}, {a: [[6, 7], [8, 9]]});
+  nomatch({'a.1': 9}, {a: [[6, 7], [8, 9]]});
+  match({"a.1": 2}, {a: [0, {1: 2}, 3]});
+  match({"a.1": {1: 2}}, {a: [0, {1: 2}, 3]});
+  match({"x.1.y": 8}, {x: [7, {y: 8}, 9]});
+  // comes from trying '1' as key in the plain object
+  match({"x.1.y": null}, {x: [7, {y: 8}, 9]});
+  match({"a.1.b": 9}, {a: [7, {b: 9}, {1: {b: 'foo'}}]});
+  match({"a.1.b": 'foo'}, {a: [7, {b: 9}, {1: {b: 'foo'}}]});
+  match({"a.1.b": null}, {a: [7, {b: 9}, {1: {b: 'foo'}}]});
+  match({"a.1.b": 2}, {a: [1, [{b: 2}], 3]});
+  nomatch({"a.1.b": null}, {a: [1, [{b: 2}], 3]});
+  // this is new behavior in mongo 2.5
+  nomatch({"a.0.b": null}, {a: [5]});
+  match({"a.1": 4}, {a: [{1: 4}, 5]});
+  match({"a.1": 5}, {a: [{1: 4}, 5]});
+  nomatch({"a.1": null}, {a: [{1: 4}, 5]});
+  match({"a.1.foo": 4}, {a: [{1: {foo: 4}}, {foo: 5}]});
+  match({"a.1.foo": 5}, {a: [{1: {foo: 4}}, {foo: 5}]});
+  match({"a.1.foo": null}, {a: [{1: {foo: 4}}, {foo: 5}]});
 
   // trying to access a dotted field that is undefined at some point
   // down the chain
@@ -609,6 +825,9 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
     match({$or: []}, {});
   });
   test.throws(function () {
+    match({$or: [5]}, {});
+  });
+  test.throws(function () {
     match({$or: []}, {a: 1});
   });
   match({$or: [{a: 1}]}, {a: 1});
@@ -622,6 +841,12 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   match({$or: [{a: 1}, {a: 2}], b: 2}, {a: 1, b: 2});
   nomatch({$or: [{a: 2}, {a: 3}], b: 2}, {a: 1, b: 2});
   nomatch({$or: [{a: 1}, {a: 2}], b: 3}, {a: 1, b: 2});
+
+  // Combining $or with equality
+  match({x: 1, $or: [{a: 1}, {b: 1}]}, {x: 1, b: 1});
+  match({$or: [{a: 1}, {b: 1}], x: 1}, {x: 1, b: 1});
+  nomatch({x: 1, $or: [{a: 1}, {b: 1}]}, {b: 1});
+  nomatch({x: 1, $or: [{a: 1}, {b: 1}]}, {x: 1});
 
   // $or and $lt, $lte, $gt, $gte
   match({$or: [{a: {$lte: 1}}, {a: 2}]}, {a: 1});
@@ -688,6 +913,9 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
   // $nor
   test.throws(function () {
     match({$nor: []}, {});
+  });
+  test.throws(function () {
+    match({$nor: [5]}, {});
   });
   test.throws(function () {
     match({$nor: []}, {a: 1});
@@ -768,6 +996,9 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
     match({$and: []}, {});
   });
   test.throws(function () {
+    match({$and: [5]}, {});
+  });
+  test.throws(function () {
     match({$and: []}, {a: 1});
   });
   match({$and: [{a: 1}]}, {a: 1});
@@ -846,7 +1077,9 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
 
   // $where
   match({$where: "this.a === 1"}, {a: 1});
+  match({$where: "obj.a === 1"}, {a: 1});
   nomatch({$where: "this.a !== 1"}, {a: 1});
+  nomatch({$where: "obj.a !== 1"}, {a: 1});
   nomatch({$where: "this.a === 1", a: 2}, {a: 1});
   match({$where: "this.a === 1", b: 2}, {a: 1, b: 2});
   match({$where: "this.a === 1 && this.b === 2"}, {a: 1, b: 2});
@@ -889,6 +1122,29 @@ Tinytest.add("minimongo - selector_compiler", function (test) {
         {dogs: [{name: "Fido", age: 5}, {name: "Rex", age: 3}]});
   nomatch({dogs: {$elemMatch: {name: /e/, age: 5}}},
           {dogs: [{name: "Fido", age: 5}, {name: "Rex", age: 3}]});
+  match({x: {$elemMatch: {y: 9}}}, {x: [{y: 9}]});
+  nomatch({x: {$elemMatch: {y: 9}}}, {x: [[{y: 9}]]});
+  match({x: {$elemMatch: {$gt: 5, $lt: 9}}}, {x: [8]});
+  nomatch({x: {$elemMatch: {$gt: 5, $lt: 9}}}, {x: [[8]]});
+  match({'a.x': {$elemMatch: {y: 9}}},
+        {a: [{x: []}, {x: [{y: 9}]}]});
+  nomatch({a: {$elemMatch: {x: 5}}}, {a: {x: 5}});
+  match({a: {$elemMatch: {0: {$gt: 5, $lt: 9}}}}, {a: [[6]]});
+  match({a: {$elemMatch: {'0.b': {$gt: 5, $lt: 9}}}}, {a: [[{b:6}]]});
+  match({a: {$elemMatch: {x: 1, $or: [{a: 1}, {b: 1}]}}},
+        {a: [{x: 1, b: 1}]});
+  match({a: {$elemMatch: {$or: [{a: 1}, {b: 1}], x: 1}}},
+        {a: [{x: 1, b: 1}]});
+  nomatch({a: {$elemMatch: {x: 1, $or: [{a: 1}, {b: 1}]}}},
+          {a: [{b: 1}]});
+  nomatch({a: {$elemMatch: {x: 1, $or: [{a: 1}, {b: 1}]}}},
+          {a: [{x: 1}]});
+  nomatch({a: {$elemMatch: {x: 1, $or: [{a: 1}, {b: 1}]}}},
+          {a: [{x: 1}, {b: 1}]});
+
+  // $comment
+  match({a: 5, $comment: "asdf"}, {a: 5});
+  nomatch({a: 6, $comment: "asdf"}, {a: 5});
 
   // XXX still needs tests:
   // - non-scalar arguments to $gt, $lt, etc
@@ -898,12 +1154,18 @@ Tinytest.add("minimongo - projection_compiler", function (test) {
   var testProjection = function (projection, tests) {
     var projection_f = LocalCollection._compileProjection(projection);
     var equalNonStrict = function (a, b, desc) {
-      test.equal(EJSON.stringify(a), EJSON.stringify(b), desc);
+      test.isTrue(_.isEqual(a, b), desc);
     };
 
     _.each(tests, function (testCase) {
       equalNonStrict(projection_f(testCase[0]), testCase[1], testCase[2]);
     });
+  };
+
+  var testCompileProjectionThrows = function (projection, expectedError) {
+    test.throws(function () {
+      LocalCollection._compileProjection(projection);
+    }, expectedError);
   };
 
   testProjection({ 'foo': 1, 'bar': 1 }, [
@@ -972,23 +1234,51 @@ Tinytest.add("minimongo - projection_compiler", function (test) {
      "blacklist nested - path not found in doc"]
   ]);
 
-  test.throws(function () {
-    testProjection({ 'inc': 1, 'excl': 0 }, [
-      [ { inc: 42, excl: 42 }, { inc: 42 }, "Can't combine incl/excl rules" ]
-    ]);
-  });
+  testProjection({ _id: 1 }, [
+    [{ _id: 42, x: 1, y: { z: "2" } },
+     { _id: 42 },
+     "_id whitelisted"],
+    [{ _id: 33 },
+     { _id: 33 },
+     "_id whitelisted, _id only"],
+    [{ x: 1 },
+     {},
+     "_id whitelisted, no _id"]
+  ]);
 
-  test.throws(function () {
-    testProjection({ 'a': 1, 'a.b': 1 }, [
-      [ { a: { b: 42 } }, { a: { b: 42 } }, "Can't have ambiguous rules (one is prefix of another)" ]
-    ]);
-  });
+  testProjection({ _id: 0 }, [
+    [{ _id: 42, x: 1, y: { z: "2" } },
+     { x: 1, y: { z: "2" } },
+     "_id blacklisted"],
+    [{ _id: 33 },
+     {},
+     "_id blacklisted, _id only"],
+    [{ x: 1 },
+     { x: 1 },
+     "_id blacklisted, no _id"]
+  ]);
 
-  test.throws(function () {
-    testProjection("some string", [
-      [ { a: { b: 42 } }, { a: { b: 42 } }, "Projection is not a hash" ]
-    ]);
-  });
+  testProjection({}, [
+    [{ a: 1, b: 2, c: "3" },
+     { a: 1, b: 2, c: "3" },
+     "empty projection"]
+  ]);
+
+  testCompileProjectionThrows(
+    { 'inc': 1, 'excl': 0 },
+    "You cannot currently mix including and excluding fields");
+  testCompileProjectionThrows(
+    { _id: 1, a: 0 },
+    "You cannot currently mix including and excluding fields");
+
+  testCompileProjectionThrows(
+    { 'a': 1, 'a.b': 1 },
+    "using both of them may trigger unexpected behavior");
+  testCompileProjectionThrows(
+    { 'a.b.c': 1, 'a.b': 1, 'a': 1 },
+    "using both of them may trigger unexpected behavior");
+
+  testCompileProjectionThrows("some string", "fields option must be an object");
 });
 
 Tinytest.add("minimongo - fetch with fields", function (test) {
@@ -1067,6 +1357,106 @@ Tinytest.add("minimongo - fetch with fields", function (test) {
     if (!i) return;
     test.isTrue(x.i === arr[i-1].i + 1);
   });
+
+  // Temporary unsupported operators
+  // queries are taken from MongoDB docs examples
+  test.throws(function () {
+    c.find({}, { fields: { 'grades.$': 1 } });
+  });
+  test.throws(function () {
+    c.find({}, { fields: { grades: { $elemMatch: { mean: 70 } } } });
+  });
+  test.throws(function () {
+    c.find({}, { fields: { grades: { $slice: [20, 10] } } });
+  });
+});
+
+Tinytest.add("minimongo - fetch with projection, subarrays", function (test) {
+  // Apparently projection of type 'foo.bar.x' for
+  // { foo: [ { bar: { x: 42 } }, { bar: { x: 3 } } ] }
+  // should return exactly this object. More precisely, arrays are considered as
+  // sets and are queried separately and then merged back to result set
+  var c = new LocalCollection();
+
+  // Insert a test object with two set fields
+  c.insert({
+    setA: [{
+      fieldA: 42,
+      fieldB: 33
+    }, {
+      fieldA: "the good",
+      fieldB: "the bad",
+      fieldC: "the ugly"
+    }],
+    setB: [{
+      anotherA: { },
+      anotherB: "meh"
+    }, {
+      anotherA: 1234,
+      anotherB: 431
+    }]
+  });
+
+  var equalNonStrict = function (a, b, desc) {
+    test.isTrue(_.isEqual(a, b), desc);
+  };
+
+  var testForProjection = function (projection, expected) {
+    var fetched = c.find({}, { fields: projection }).fetch()[0];
+    equalNonStrict(fetched, expected, "failed sub-set projection: " +
+                                      JSON.stringify(projection));
+  };
+
+  testForProjection({ 'setA.fieldA': 1, 'setB.anotherB': 1, _id: 0 },
+                    {
+                      setA: [{ fieldA: 42 }, { fieldA: "the good" }],
+                      setB: [{ anotherB: "meh" }, { anotherB: 431 }]
+                    });
+
+  testForProjection({ 'setA.fieldA': 0, 'setB.anotherA': 0, _id: 0 },
+                    {
+                      setA: [{fieldB:33}, {fieldB:"the bad",fieldC:"the ugly"}],
+                      setB: [{ anotherB: "meh" }, { anotherB: 431 }]
+                    });
+
+  c.remove({});
+  c.insert({a:[[{b:1,c:2},{b:2,c:4}],{b:3,c:5},[{b:4, c:9}]]});
+
+  testForProjection({ 'a.b': 1, _id: 0 },
+                    {a: [ [ { b: 1 }, { b: 2 } ], { b: 3 }, [ { b: 4 } ] ] });
+  testForProjection({ 'a.b': 0, _id: 0 },
+                    {a: [ [ { c: 2 }, { c: 4 } ], { c: 5 }, [ { c: 9 } ] ] });
+});
+
+Tinytest.add("minimongo - fetch with projection, deep copy", function (test) {
+  // Compiled fields projection defines the contract: returned document doesn't
+  // retain anything from the passed argument.
+  var doc = {
+    a: { x: 42 },
+    b: {
+      y: { z: 33 }
+    },
+    c: "asdf"
+  };
+
+  var fields = {
+    'a': 1,
+    'b.y': 1
+  };
+
+  var projectionFn = LocalCollection._compileProjection(fields);
+  var filteredDoc = projectionFn(doc);
+  doc.a.x++;
+  doc.b.y.z--;
+  test.equal(filteredDoc.a.x, 42, "projection returning deep copy - including");
+  test.equal(filteredDoc.b.y.z, 33, "projection returning deep copy - including");
+
+  fields = { c: 0 };
+  projectionFn = LocalCollection._compileProjection(fields);
+  filteredDoc = projectionFn(doc);
+
+  doc.a.x = 5;
+  test.equal(filteredDoc.a.x, 43, "projection returning deep copy - excluding");
 });
 
 Tinytest.add("minimongo - observe ordered with projection", function (test) {
@@ -1103,6 +1493,14 @@ Tinytest.add("minimongo - observe ordered with projection", function (test) {
   var idA2 = Random.id();
   c.insert({_id: idA2, a:2});
   test.equal(operations.shift(), undefined);
+
+  var cursor = c.find({}, {fields: {a: 1, _id: 0}});
+  test.throws(function () {
+    cursor.observeChanges({added: function () {}});
+  });
+  test.throws(function () {
+    cursor.observe({added: function () {}});
+  });
 
   // test initial inserts (and backwards sort)
   handle = c.find({}, {sort: {a: -1}, fields: { a: 1 } }).observe(cbs);
@@ -1182,16 +1580,17 @@ Tinytest.add("minimongo - ordering", function (test) {
     {b: {}}, {b: [1, 2, 3]}, {b: [1, 2, 4]},
     [], [1, 2], [1, 2, 3], [1, 2, 4], [1, 2, "4"], [1, 2, [4]],
     shortBinary, longBinary1, longBinary2,
-    new LocalCollection._ObjectID("1234567890abcd1234567890"),
-    new LocalCollection._ObjectID("abcd1234567890abcd123456"),
+    new MongoID.ObjectID("1234567890abcd1234567890"),
+    new MongoID.ObjectID("abcd1234567890abcd123456"),
     false, true,
     date1, date2
   ]);
 
   // document ordering under a sort specification
   var verify = function (sorts, docs) {
-    _.each(sorts, function (sort) {
-      assert_ordering(test, LocalCollection._compileSort(sort), docs);
+    _.each(_.isArray(sorts) ? sorts : [sorts], function (sort) {
+      var sorter = new Minimongo.Sorter(sort);
+      assert_ordering(test, sorter.getComparator(), docs);
     });
   };
 
@@ -1218,14 +1617,111 @@ Tinytest.add("minimongo - ordering", function (test) {
          [{c: 1}, {a: 1, b: 2}, {a: 1, b: 3}, {a: 2, b: 0}]);
 
   test.throws(function () {
-    LocalCollection._compileSort("a");
+    new Minimongo.Sorter("a");
   });
 
   test.throws(function () {
-    LocalCollection._compileSort(123);
+    new Minimongo.Sorter(123);
   });
 
-  test.equal(LocalCollection._compileSort({})({a:1}, {a:2}), 0);
+  // We don't support $natural:1 (since we don't actually have Mongo's on-disk
+  // ordering available!)
+  test.throws(function () {
+    new Minimongo.Sorter({$natural: 1});
+  });
+
+  // No sort spec implies everything equal.
+  test.equal(new Minimongo.Sorter({}).getComparator()({a:1}, {a:2}), 0);
+
+  // All sorts of array edge cases!
+  // Increasing sort sorts by the smallest element it finds; 1 < 2.
+  verify({a: 1}, [
+    {a: [1, 10, 20]},
+    {a: [5, 2, 99]}
+  ]);
+  // Decreasing sorts by largest it finds; 99 > 20.
+  verify({a: -1}, [
+    {a: [5, 2, 99]},
+    {a: [1, 10, 20]}
+  ]);
+  // Can also sort by specific array indices.
+  verify({'a.1': 1}, [
+    {a: [5, 2, 99]},
+    {a: [1, 10, 20]}
+  ]);
+  // We do NOT expand sub-arrays, so the minimum in the second doc is 5, not
+  // -20. (Numbers always sort before arrays.)
+  verify({a: 1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [-5, -20], 18]}
+  ]);
+  // The maximum in each of these is the array, since arrays are "greater" than
+  // numbers. And [10, 15] is greater than [-5, -20].
+  verify({a: -1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [-5, -20], 18]}
+  ]);
+  // 'a.0' here ONLY means "first element of a", not "first element of something
+  // found in a", so it CANNOT find the 10 or -5.
+  verify({'a.0': 1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [-5, -20], 18]}
+  ]);
+  verify({'a.0': -1}, [
+    {a: [5, [-5, -20], 18]},
+    {a: [1, [10, 15], 20]}
+  ]);
+  // Similarly, this is just comparing [-5,-20] to [10, 15].
+  verify({'a.1': 1}, [
+    {a: [5, [-5, -20], 18]},
+    {a: [1, [10, 15], 20]}
+  ]);
+  verify({'a.1': -1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [-5, -20], 18]}
+  ]);
+  // Here we are just comparing [10,15] directly to [19,3] (and NOT also
+  // iterating over the numbers; this is implemented by setting dontIterate in
+  // makeLookupFunction).  So [10,15]<[19,3] even though 3 is the smallest
+  // number you can find there.
+  verify({'a.1': 1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [19, 3], 18]}
+  ]);
+  verify({'a.1': -1}, [
+    {a: [5, [19, 3], 18]},
+    {a: [1, [10, 15], 20]}
+  ]);
+  // Minimal elements are 1 and 5.
+  verify({a: 1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [19, 3], 18]}
+  ]);
+  // Maximal elements are [19,3] and [10,15] (because arrays sort higher than
+  // numbers), even though there's a 20 floating around.
+  verify({a: -1}, [
+    {a: [5, [19, 3], 18]},
+    {a: [1, [10, 15], 20]}
+  ]);
+  // Maximal elements are [10,15] and [3,19].  [10,15] is bigger even though 19
+  // is the biggest number in them, because array comparison is lexicographic.
+  verify({a: -1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [3, 19], 18]}
+  ]);
+
+  // (0,4) < (0,5), so they go in this order.  It's not correct to consider
+  // (0,3) as a sort key for the second document because they come from
+  // different a-branches.
+  verify({'a.x': 1, 'a.y': 1}, [
+    {a: [{x: 0, y: 4}]},
+    {a: [{x: 0, y: 5}, {x: 1, y: 3}]}
+  ]);
+
+  verify({'a.0.s': 1}, [
+    {a: [ {s: 1} ]},
+    {a: [ {s: 2} ]}
+  ]);
 });
 
 Tinytest.add("minimongo - sort", function (test) {
@@ -1301,19 +1797,176 @@ Tinytest.add("minimongo - array sort", function (test) {
   // in the document, and when sorting descending, you use the maximum value you
   // can find. So [1, 4] shows up in the 1 slot when sorting ascending and the 4
   // slot when sorting descending.
-  c.insert({up: 1, down: 1, a: {x: [1, 4]}});
-  c.insert({up: 2, down: 2, a: [{x: [2]}, {x: 3}]});
-  c.insert({up: 0, down: 4, a: {x: 0}});
-  c.insert({up: 3, down: 3, a: {x: 2.5}});
-  c.insert({up: 4, down: 0, a: {x: 5}});
+  //
+  // Similarly, "selected" is the index that the doc should have in the query
+  // that sorts ascending on "a.x" and selects {'a.x': {$gt: 1}}. In this case,
+  // the 1 in [1, 4] may not be used as a sort key.
+  c.insert({up: 1, down: 1, selected: 2, a: {x: [1, 4]}});
+  c.insert({up: 2, down: 2, selected: 0, a: [{x: [2]}, {x: 3}]});
+  c.insert({up: 0, down: 4,              a: {x: 0}});
+  c.insert({up: 3, down: 3, selected: 1, a: {x: 2.5}});
+  c.insert({up: 4, down: 0, selected: 3, a: {x: 5}});
 
-  test.equal(
-    _.pluck(c.find({}, {sort: {'a.x': 1}}).fetch(), 'up'),
-    _.range(c.find().count()));
+  // Test that the the documents in "cursor" contain values with the name
+  // "field" running from 0 to the max value of that name in the collection.
+  var testCursorMatchesField = function (cursor, field) {
+    var fieldValues = [];
+    c.find().forEach(function (doc) {
+      if (_.has(doc, field))
+        fieldValues.push(doc[field]);
+    });
+    test.equal(_.pluck(cursor.fetch(), field),
+               _.range(_.max(fieldValues) + 1));
+  };
 
-  test.equal(
-    _.pluck(c.find({}, {sort: {'a.x': -1}}).fetch(), 'down'),
-    _.range(c.find().count()));
+  testCursorMatchesField(c.find({}, {sort: {'a.x': 1}}), 'up');
+  testCursorMatchesField(c.find({}, {sort: {'a.x': -1}}), 'down');
+  testCursorMatchesField(c.find({'a.x': {$gt: 1}}, {sort: {'a.x': 1}}),
+                         'selected');
+});
+
+Tinytest.add("minimongo - sort keys", function (test) {
+  var keyListToObject = function (keyList) {
+    var obj = {};
+    _.each(keyList, function (key) {
+      obj[EJSON.stringify(key)] = true;
+    });
+    return obj;
+  };
+
+  var testKeys = function (sortSpec, doc, expectedKeyList) {
+    var expectedKeys = keyListToObject(expectedKeyList);
+    var sorter = new Minimongo.Sorter(sortSpec);
+
+    var actualKeyList = [];
+    sorter._generateKeysFromDoc(doc, function (key) {
+      actualKeyList.push(key);
+    });
+    var actualKeys = keyListToObject(actualKeyList);
+    test.equal(actualKeys, expectedKeys);
+  };
+
+  var testParallelError = function (sortSpec, doc) {
+    var sorter = new Minimongo.Sorter(sortSpec);
+    test.throws(function () {
+      sorter._generateKeysFromDoc(doc, function (){});
+    }, /parallel arrays/);
+  };
+
+  // Just non-array fields.
+  testKeys({'a.x': 1, 'a.y': 1},
+           {a: {x: 0, y: 5}},
+           [[0,5]]);
+
+  // Ensure that we don't get [0,3] and [1,5].
+  testKeys({'a.x': 1, 'a.y': 1},
+           {a: [{x: 0, y: 5}, {x: 1, y: 3}]},
+           [[0,5], [1,3]]);
+
+  // Ensure we can combine "array fields" with "non-array fields".
+  testKeys({'a.x': 1, 'a.y': 1, b: -1},
+           {a: [{x: 0, y: 5}, {x: 1, y: 3}], b: 42},
+           [[0,5,42], [1,3,42]]);
+  testKeys({b: -1, 'a.x': 1, 'a.y': 1},
+           {a: [{x: 0, y: 5}, {x: 1, y: 3}], b: 42},
+           [[42,0,5], [42,1,3]]);
+  testKeys({'a.x': 1, b: -1, 'a.y': 1},
+           {a: [{x: 0, y: 5}, {x: 1, y: 3}], b: 42},
+           [[0,42,5], [1,42,3]]);
+  testKeys({a: 1, b: 1},
+           {a: [1, 2, 3], b: 42},
+           [[1,42], [2,42], [3,42]]);
+
+  // Don't support multiple arrays at the same level.
+  testParallelError({a: 1, b: 1},
+                    {a: [1, 2, 3], b: [42]});
+
+  // We are MORE STRICT than Mongo here; Mongo supports this!
+  // XXX support this too  #NestedArraySort
+  testParallelError({'a.x': 1, 'a.y': 1},
+                    {a: [{x: 1, y: [2, 3]},
+                         {x: 2, y: [4, 5]}]});
+});
+
+Tinytest.add("minimongo - sort key filter", function (test) {
+  var testOrder = function (sortSpec, selector, doc1, doc2) {
+    var matcher = new Minimongo.Matcher(selector);
+    var sorter = new Minimongo.Sorter(sortSpec, {matcher: matcher});
+    var comparator = sorter.getComparator();
+    var comparison = comparator(doc1, doc2);
+    test.isTrue(comparison < 0);
+  };
+
+  testOrder({'a.x': 1}, {'a.x': {$gt: 1}},
+            {a: {x: 3}},
+            {a: {x: [1, 4]}});
+  testOrder({'a.x': 1}, {'a.x': {$gt: 0}},
+            {a: {x: [1, 4]}},
+            {a: {x: 3}});
+
+  var keyCompatible = function (sortSpec, selector, key, compatible) {
+    var matcher = new Minimongo.Matcher(selector);
+    var sorter = new Minimongo.Sorter(sortSpec, {matcher: matcher});
+    var actual = sorter._keyCompatibleWithSelector(key);
+    test.equal(actual, compatible);
+  };
+
+  keyCompatible({a: 1}, {a: 5}, [5], true);
+  keyCompatible({a: 1}, {a: 5}, [8], false);
+  keyCompatible({a: 1}, {a: {x: 5}}, [{x: 5}], true);
+  keyCompatible({a: 1}, {a: {x: 5}}, [{x: 5, y: 9}], false);
+  keyCompatible({'a.x': 1}, {a: {x: 5}}, [5], true);
+  // To confirm this:
+  //   > db.x.insert({_id: "q", a: [{x:1}, {x:5}], b: 2})
+  //   > db.x.insert({_id: "w", a: [{x:5}, {x:10}], b: 1})
+  //   > db.x.find({}).sort({'a.x': 1, b: 1})
+  //   { "_id" : "q", "a" : [  {  "x" : 1 },  {  "x" : 5 } ], "b" : 2 }
+  //   { "_id" : "w", "a" : [  {  "x" : 5 },  {  "x" : 10 } ], "b" : 1 }
+  //   > db.x.find({a: {x:5}}).sort({'a.x': 1, b: 1})
+  //   { "_id" : "q", "a" : [  {  "x" : 1 },  {  "x" : 5 } ], "b" : 2 }
+  //   { "_id" : "w", "a" : [  {  "x" : 5 },  {  "x" : 10 } ], "b" : 1 }
+  //   > db.x.find({'a.x': 5}).sort({'a.x': 1, b: 1})
+  //   { "_id" : "w", "a" : [  {  "x" : 5 },  {  "x" : 10 } ], "b" : 1 }
+  //   { "_id" : "q", "a" : [  {  "x" : 1 },  {  "x" : 5 } ], "b" : 2 }
+  // ie, only the last one manages to trigger the key compatibility code,
+  // not the previous one.  (The "b" sort is necessary because when the key
+  // compatibility code *does* kick in, both documents only end up with "5"
+  // for the first field as their only sort key, and we need to differentiate
+  // somehow...)
+  keyCompatible({'a.x': 1}, {a: {x: 5}}, [1], true);
+  keyCompatible({'a.x': 1}, {'a.x': 5}, [5], true);
+  keyCompatible({'a.x': 1}, {'a.x': 5}, [1], false);
+
+  // Regex key check.
+  keyCompatible({a: 1}, {a: /^foo+/}, ['foo'], true);
+  keyCompatible({a: 1}, {a: /^foo+/}, ['foooo'], true);
+  keyCompatible({a: 1}, {a: /^foo+/}, ['foooobar'], true);
+  keyCompatible({a: 1}, {a: /^foo+/}, ['afoooo'], false);
+  keyCompatible({a: 1}, {a: /^foo+/}, [''], false);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+"}}, ['foo'], true);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+"}}, ['foooo'], true);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+"}}, ['foooobar'], true);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+"}}, ['afoooo'], false);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+"}}, [''], false);
+
+  keyCompatible({a: 1}, {a: /^foo+/i}, ['foo'], true);
+  // Key compatibility check appears to be turned off for regexps with flags.
+  keyCompatible({a: 1}, {a: /^foo+/i}, ['bar'], true);
+  keyCompatible({a: 1}, {a: /^foo+/m}, ['bar'], true);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+", $options: "i"}}, ['bar'], true);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+", $options: "m"}}, ['bar'], true);
+
+  // Multiple keys!
+  keyCompatible({a: 1, b: 1, c: 1},
+                {a: {$gt: 5}, c: {$lt: 3}}, [6, "bla", 2], true);
+  keyCompatible({a: 1, b: 1, c: 1},
+                {a: {$gt: 5}, c: {$lt: 3}}, [6, "bla", 4], false);
+  keyCompatible({a: 1, b: 1, c: 1},
+                {a: {$gt: 5}, c: {$lt: 3}}, [3, "bla", 1], false);
+  // No filtering is done (ie, all keys are compatible) if the first key isn't
+  // constrained.
+  keyCompatible({a: 1, b: 1, c: 1},
+                {c: {$lt: 3}}, [3, "bla", 4], true);
 });
 
 Tinytest.add("minimongo - binary search", function (test) {
@@ -1374,26 +2027,27 @@ Tinytest.add("minimongo - binary search", function (test) {
 });
 
 Tinytest.add("minimongo - modify", function (test) {
-  var modify = function (doc, mod, result) {
-    var copy = EJSON.clone(doc);
-    LocalCollection._modify(copy, mod);
-    if (!LocalCollection._f._equal(copy, result)) {
-      // XXX super janky
-      test.fail({type: "minimongo-modifier",
-                 message: "modifier test failure",
-                 input_doc: JSON.stringify(doc),
-                 modifier: JSON.stringify(mod),
-                 expected: JSON.stringify(result),
-                 actual: JSON.stringify(copy)
-                });
-    } else {
-      test.ok();
-    }
+  var modifyWithQuery = function (doc, query, mod, expected) {
+    var coll = new LocalCollection;
+    coll.insert(doc);
+    // The query is relevant for 'a.$.b'.
+    coll.update(query, mod);
+    var actual = coll.findOne();
+    delete actual._id;  // added by insert
+    test.equal(actual, expected, EJSON.stringify({input: doc, mod: mod}));
+  };
+  var modify = function (doc, mod, expected) {
+    modifyWithQuery(doc, {}, mod, expected);
+  };
+  var exceptionWithQuery = function (doc, query, mod) {
+    var coll = new LocalCollection;
+    coll.insert(doc);
+    test.throws(function () {
+      coll.update(query, mod);
+    });
   };
   var exception = function (doc, mod) {
-    test.throws(function () {
-      LocalCollection._modify(EJSON.clone(doc), mod);
-    });
+    exceptionWithQuery(doc, {}, mod);
   };
 
   // document replacement
@@ -1419,28 +2073,80 @@ Tinytest.add("minimongo - modify", function (test) {
   modify({a: [null, null, null]}, {$set: {'a.3.b': 12}}, {
     a: [null, null, null, {b: 12}]});
   exception({a: []}, {$set: {'a.b': 12}});
-  test.expect_fail();
   exception({a: 12}, {$set: {'a.b': 99}}); // tested on mongo
-  test.expect_fail();
   exception({a: 'x'}, {$set: {'a.b': 99}});
-  test.expect_fail();
   exception({a: true}, {$set: {'a.b': 99}});
-  test.expect_fail();
   exception({a: null}, {$set: {'a.b': 99}});
   modify({a: {}}, {$set: {'a.3': 12}}, {a: {'3': 12}});
   modify({a: []}, {$set: {'a.3': 12}}, {a: [null, null, null, 12]});
-  modify({}, {$set: {'': 12}}, {'': 12}); // tested on mongo
-  test.expect_fail();
+  exception({}, {$set: {'': 12}}); // tested on mongo
   exception({}, {$set: {'.': 12}}); // tested on mongo
-  modify({}, {$set: {'. ': 12}}, {'': {' ': 12}}); // tested on mongo
-  modify({}, {$inc: {'... ': 12}}, {'': {'': {'': {' ': 12}}}}); // tested
-  modify({}, {$set: {'a..b': 12}}, {a: {'': {b: 12}}});
+  exception({}, {$set: {'a.': 12}}); // tested on mongo
+  exception({}, {$set: {'. ': 12}}); // tested on mongo
+  exception({}, {$inc: {'... ': 12}}); // tested on mongo
+  exception({}, {$set: {'a..b': 12}}); // tested on mongo
   modify({a: [1,2,3]}, {$set: {'a.01': 99}}, {a: [1, 99, 3]});
   modify({a: [1,{a: 98},3]}, {$set: {'a.01.b': 99}}, {a: [1,{a:98, b: 99},3]});
   modify({}, {$set: {'2.a.b': 12}}, {'2': {'a': {'b': 12}}}); // tested
-  modify({x: []}, {$set: {'x.2..a': 99}}, {x: [null, null, {'': {a: 99}}]});
+  exception({x: []}, {$set: {'x.2..a': 99}});
   modify({x: [null, null]}, {$set: {'x.2.a': 1}}, {x: [null, null, {a: 1}]});
   exception({x: [null, null]}, {$set: {'x.1.a': 1}});
+
+  // a.$.b
+  modifyWithQuery({a: [{x: 2}, {x: 4}]}, {'a.x': 4}, {$set: {'a.$.z': 9}},
+                  {a: [{x: 2}, {x: 4, z: 9}]});
+  exception({a: [{x: 2}, {x: 4}]}, {$set: {'a.$.z': 9}});
+  exceptionWithQuery({a: [{x: 2}, {x: 4}], b: 5}, {b: 5}, {$set: {'a.$.z': 9}});
+  // can't have two $
+  exceptionWithQuery({a: [{x: [2]}]}, {'a.x': 2}, {$set: {'a.$.x.$': 9}});
+  modifyWithQuery({a: [5, 6, 7]}, {a: 6}, {$set: {'a.$': 9}}, {a: [5, 9, 7]});
+  modifyWithQuery({a: [{b: [{c: 9}, {c: 10}]}, {b: {c: 11}}]}, {'a.b.c': 10},
+                  {$unset: {'a.$.b': 1}}, {a: [{}, {b: {c: 11}}]});
+  modifyWithQuery({a: [{b: [{c: 9}, {c: 10}]}, {b: {c: 11}}]}, {'a.b.c': 11},
+                  {$unset: {'a.$.b': 1}},
+                  {a: [{b: [{c: 9}, {c: 10}]}, {}]});
+  modifyWithQuery({a: [1]}, {'a.0': 1}, {$set: {'a.$': 5}}, {a: [5]});
+  modifyWithQuery({a: [9]}, {a: {$mod: [2, 1]}}, {$set: {'a.$': 5}}, {a: [5]});
+  // Negatives don't set '$'.
+  exceptionWithQuery({a: [1]}, {$not: {a: 2}}, {$set: {'a.$': 5}});
+  exceptionWithQuery({a: [1]}, {'a.0': {$ne: 2}}, {$set: {'a.$': 5}});
+  // One $or clause works.
+  modifyWithQuery({a: [{x: 2}, {x: 4}]},
+                  {$or: [{'a.x': 4}]}, {$set: {'a.$.z': 9}},
+                  {a: [{x: 2}, {x: 4, z: 9}]});
+  // More $or clauses throw.
+  exceptionWithQuery({a: [{x: 2}, {x: 4}]},
+                     {$or: [{'a.x': 4}, {'a.x': 4}]},
+                     {$set: {'a.$.z': 9}});
+  // $and uses the last one.
+  modifyWithQuery({a: [{x: 1}, {x: 3}]},
+                  {$and: [{'a.x': 1}, {'a.x': 3}]},
+                  {$set: {'a.$.x': 5}},
+                  {a: [{x: 1}, {x: 5}]});
+  modifyWithQuery({a: [{x: 1}, {x: 3}]},
+                  {$and: [{'a.x': 3}, {'a.x': 1}]},
+                  {$set: {'a.$.x': 5}},
+                  {a: [{x: 5}, {x: 3}]});
+  // Same goes for the implicit AND of a document selector.
+  modifyWithQuery({a: [{x: 1}, {y: 3}]},
+                  {'a.x': 1, 'a.y': 3},
+                  {$set: {'a.$.z': 5}},
+                  {a: [{x: 1}, {y: 3, z: 5}]});
+  // with $near, make sure it finds the closest one
+  modifyWithQuery({a: [{b: [1,1]},
+                       {b: [ [3,3], [4,4] ]},
+                       {b: [9,9]}]},
+                  {'a.b': {$near: [5, 5]}},
+                  {$set: {'a.$.b': 'k'}},
+                  {a: [{b: [1,1]}, {b: 'k'}, {b: [9,9]}]});
+  modifyWithQuery({a: [{x: 1}, {y: 1}, {x: 1, y: 1}]},
+                  {a: {$elemMatch: {x: 1, y: 1}}},
+                  {$set: {'a.$.x': 2}},
+                  {a: [{x: 1}, {y: 1}, {x: 2, y: 1}]});
+  modifyWithQuery({a: [{b: [{x: 1}, {y: 1}, {x: 1, y: 1}]}]},
+                  {'a.b': {$elemMatch: {x: 1, y: 1}}},
+                  {$set: {'a.$.b': 3}},
+                  {a: [{b: 3}]});
 
   // $inc
   modify({a: 1, b: 2}, {$inc: {a: 10}}, {a: 11, b: 2});
@@ -1458,6 +2164,7 @@ Tinytest.add("minimongo - modify", function (test) {
   modify({a: [1, 2]}, {$inc: {'a.3': 10}}, {a: [1, 2, null, 10]});
   modify({a: {b: 2}}, {$inc: {'a.b': 10}}, {a: {b: 12}});
   modify({a: {b: 2}}, {$inc: {'a.c': 10}}, {a: {b: 2, c: 10}});
+  exception({}, {$inc: {_id: 1}});
 
   // $set
   modify({a: 1, b: 2}, {$set: {a: 10}}, {a: 10, b: 2});
@@ -1469,6 +2176,9 @@ Tinytest.add("minimongo - modify", function (test) {
   modify({a: [1], b: 2}, {$set: {'a.1': 9}}, {a: [1, 9], b: 2});
   modify({a: [1], b: 2}, {$set: {'a.2': 9}}, {a: [1, null, 9], b: 2});
   modify({a: {b: 1}}, {$set: {'a.c': 9}}, {a: {b: 1, c: 9}});
+  modify({}, {$set: {'x._id': 4}}, {x: {_id: 4}});
+  exception({}, {$set: {_id: 4}});
+  exception({_id: 4}, {$set: {_id: 4}});  // even not-changing _id is bad
 
   // $unset
   modify({}, {$unset: {a: 1}}, {});
@@ -1486,6 +2196,7 @@ Tinytest.add("minimongo - modify", function (test) {
   modify({a: {b: 1}}, {$unset: {'a.b.c.d': 1}}, {a: {b: 1}});
   modify({a: {b: 1}}, {$unset: {'a.x.c.d': 1}}, {a: {b: 1}});
   modify({a: {b: {c: 1}}}, {$unset: {'a.b.c': 1}}, {a: {b: {}}});
+  exception({}, {$unset: {_id: 1}});
 
   // $push
   modify({}, {$push: {a: 1}}, {a: [1]});
@@ -1495,6 +2206,54 @@ Tinytest.add("minimongo - modify", function (test) {
   modify({a: [1]}, {$push: {a: [2]}}, {a: [1, [2]]});
   modify({a: []}, {$push: {'a.1': 99}}, {a: [null, [99]]}); // tested
   modify({a: {}}, {$push: {'a.x': 99}}, {a: {x: [99]}});
+  modify({}, {$push: {a: {$each: [1, 2, 3]}}},
+         {a: [1, 2, 3]});
+  modify({a: []}, {$push: {a: {$each: [1, 2, 3]}}},
+         {a: [1, 2, 3]});
+  modify({a: [true]}, {$push: {a: {$each: [1, 2, 3]}}},
+         {a: [true, 1, 2, 3]});
+  // No positive numbers for $slice
+  exception({}, {$push: {a: {$each: [], $slice: 5}}});
+  modify({a: [true]}, {$push: {a: {$each: [1, 2, 3], $slice: -2}}},
+         {a: [2, 3]});
+  modify({a: [false, true]}, {$push: {a: {$each: [1], $slice: -2}}},
+         {a: [true, 1]});
+  modify(
+    {a: [{x: 3}, {x: 1}]},
+    {$push: {a: {
+      $each: [{x: 4}, {x: 2}],
+      $slice: -2,
+      $sort: {x: 1}
+    }}},
+    {a: [{x: 3}, {x: 4}]});
+  modify({}, {$push: {a: {$each: [1, 2, 3], $slice: 0}}}, {a: []});
+  modify({a: [1, 2]}, {$push: {a: {$each: [1, 2, 3], $slice: 0}}}, {a: []});
+  // $push with $position modifier
+  // No negative number for $position
+  exception({a: []}, {$push: {a: {$each: [0], $position: -1}}});
+  modify({a: [1, 2]}, {$push: {a: {$each: [0], $position: 0}}},
+    {a: [0, 1, 2]});
+  modify({a: [1, 2]}, {$push: {a: {$each: [-1, 0], $position: 0}}},
+    {a: [-1, 0, 1, 2]});
+  modify({a: [1, 3]}, {$push: {a: {$each: [2], $position: 1}}}, {a: [1, 2, 3]});
+  modify({a: [1, 4]}, {$push: {a: {$each: [2, 3], $position: 1}}},
+    {a: [1, 2, 3, 4]});
+  modify({a: [1, 2]}, {$push: {a: {$each: [3], $position: 3}}}, {a: [1, 2, 3]});
+  modify({a: [1, 2]}, {$push: {a: {$each: [3], $position: 99}}},
+    {a: [1, 2, 3]});
+  modify({a: [1, 2]}, {$push: {a: {$each: [3], $position: 99, $slice: -2}}},
+    {a: [2, 3]});
+  modify(
+    {a: [{x: 1}, {x: 2}]},
+    {$push: {a: {$each: [{x: 3}], $position: 0, $sort: {x: 1}, $slice: -3}}},
+    {a: [{x: 1}, {x: 2}, {x: 3}]}
+  );
+  modify(
+    {a: [{x: 1}, {x: 2}]},
+    {$push: {a: {$each: [{x: 3}], $position: 0, $sort: {x: 1}, $slice: 0}}},
+    {a: []}
+  );
+
 
   // $pushAll
   modify({}, {$pushAll: {a: [1]}}, {a: [1]});
@@ -1534,6 +2293,8 @@ Tinytest.add("minimongo - modify", function (test) {
          {a: [1, 2, 3, 4]}); // tested
   modify({a: [1, 2]}, {$addToSet: {a: {b: 12, $each: [3, 1, 4]}}},
          {a: [1, 2, {b: 12, $each: [3, 1, 4]}]}); // tested
+  modify({}, {$addToSet: {a: {$each: []}}}, {a: []});
+  modify({}, {$addToSet: {a: {$each: [1]}}}, {a: [1]});
   modify({a: []}, {$addToSet: {'a.1': 99}}, {a: [null, [99]]});
   modify({a: {}}, {$addToSet: {'a.x': 99}}, {a: {x: [99]}});
 
@@ -1565,6 +2326,7 @@ Tinytest.add("minimongo - modify", function (test) {
   modify({a: [2, 1, 2]}, {$pull: {a: 1}}, {a: [2, 2]});
   modify({a: [2, 1, 2]}, {$pull: {a: 2}}, {a: [1]});
   modify({a: [2, 1, 2]}, {$pull: {a: 3}}, {a: [2, 1, 2]});
+  modify({a: [1, null, 2, null]}, {$pull: {a: null}}, {a: [1, 2]});
   modify({a: []}, {$pull: {a: 3}}, {a: []});
   modify({a: [[2], [2, 1], [3]]}, {$pull: {a: [2, 1]}},
          {a: [[2], [3]]}); // tested
@@ -1596,17 +2358,15 @@ Tinytest.add("minimongo - modify", function (test) {
   modify({a: {b: 12}}, {$rename: {'a.b': 'x'}}, {a: {}, x: 12}); // tested
   modify({a: {b: 12}}, {$rename: {'a.b': 'q.r'}}, {a: {}, q: {r: 12}});
   modify({a: {b: 12}}, {$rename: {'a.b': 'q.2.r'}}, {a: {}, q: {2: {r: 12}}});
-  // Opera weirdly reorders the output. But what it does tends to be close
-  // enough.
   modify({a: {b: 12}, q: {}}, {$rename: {'a.b': 'q.2.r'}},
-         (typeof opera === 'undefined' ? {a: {}, q: {2: {r: 12}}}
-                                       : {q: {2: {r: 12}}, a: {}}));
+         {a: {}, q: {2: {r: 12}}});
   exception({a: {b: 12}, q: []}, {$rename: {'a.b': 'q.2'}}); // tested
   exception({a: {b: 12}, q: []}, {$rename: {'a.b': 'q.2.r'}}); // tested
-  test.expect_fail();
-  exception({a: {b: 12}, q: []}, {$rename: {'q.1': 'x'}}); // tested
-  test.expect_fail();
-  exception({a: {b: 12}, q: []}, {$rename: {'q.1.j': 'x'}}); // tested
+  // These strange MongoDB behaviors throw.
+  // modify({a: {b: 12}, q: []}, {$rename: {'q.1': 'x'}},
+  //        {a: {b: 12}, x: []}); // tested
+  // modify({a: {b: 12}, q: []}, {$rename: {'q.1.j': 'x'}},
+  //        {a: {b: 12}, x: []}); // tested
   exception({}, {$rename: {'a': 'a'}});
   exception({}, {$rename: {'a.b': 'a.b'}});
   modify({a: 12, b: 13}, {$rename: {a: 'b'}}, {b: 12});
@@ -1659,7 +2419,8 @@ Tinytest.add("minimongo - observe ordered", function (test) {
   handle.stop();
 
   // test _suppress_initial
-  handle = c.find({}, {sort: {a: -1}}).observe(_.extend(cbs, {_suppress_initial: true}));
+  handle = c.find({}, {sort: {a: -1}}).observe(_.extend({
+    _suppress_initial: true}, cbs));
   test.equal(operations.shift(), undefined);
   c.insert({a:100});
   test.equal(operations.shift(), ['added', {a:100}, 0, idA2]);
@@ -1684,6 +2445,21 @@ Tinytest.add("minimongo - observe ordered", function (test) {
   test.equal(operations.shift(), ['added', {a:4}, 1, null]);
   c.update({a:3}, {a:3.5});
   test.equal(operations.shift(), ['changed', {a:3.5}, 0, {a:3}]);
+  handle.stop();
+
+  // test observe limit with pre-existing docs
+  c.remove({});
+  c.insert({a: 1});
+  c.insert({_id: 'two', a: 2});
+  c.insert({a: 3});
+  handle = c.find({}, {sort: {a: 1}, limit: 2}).observe(cbs);
+  test.equal(operations.shift(), ['added', {a:1}, 0, null]);
+  test.equal(operations.shift(), ['added', {a:2}, 1, null]);
+  test.equal(operations.shift(), undefined);
+  c.remove({a: 2});
+  test.equal(operations.shift(), ['removed', 'two', 1, {a:2}]);
+  test.equal(operations.shift(), ['added', {a:3}, 1, null]);
+  test.equal(operations.shift(), undefined);
   handle.stop();
 
   // test _no_indices
@@ -1771,170 +2547,10 @@ _.each([true, false], function (ordered) {
 });
 
 
-Tinytest.add("minimongo - diff changes ordering", function (test) {
-  var makeDocs = function (ids) {
-    return _.map(ids, function (id) { return {_id: id};});
-  };
-  var testMutation = function (a, b) {
-    var aa = makeDocs(a);
-    var bb = makeDocs(b);
-    var aaCopy = EJSON.clone(aa);
-    LocalCollection._diffQueryOrderedChanges(aa, bb, {
-
-      addedBefore: function (id, doc, before) {
-        if (before === null) {
-          aaCopy.push( _.extend({_id: id}, doc));
-          return;
-        }
-        for (var i = 0; i < aaCopy.length; i++) {
-          if (aaCopy[i]._id === before) {
-            aaCopy.splice(i, 0, _.extend({_id: id}, doc));
-            return;
-          }
-        }
-      },
-      movedBefore: function (id, before) {
-        var found;
-        for (var i = 0; i < aaCopy.length; i++) {
-          if (aaCopy[i]._id === id) {
-            found = aaCopy[i];
-            aaCopy.splice(i, 1);
-          }
-        }
-        if (before === null) {
-          aaCopy.push( _.extend({_id: id}, found));
-          return;
-        }
-        for (i = 0; i < aaCopy.length; i++) {
-          if (aaCopy[i]._id === before) {
-            aaCopy.splice(i, 0, _.extend({_id: id}, found));
-            return;
-          }
-        }
-      },
-      removed: function (id) {
-        var found;
-        for (var i = 0; i < aaCopy.length; i++) {
-          if (aaCopy[i]._id === id) {
-            found = aaCopy[i];
-            aaCopy.splice(i, 1);
-          }
-        }
-      }
-    });
-    test.equal(aaCopy, bb);
-  };
-
-  var testBothWays = function (a, b) {
-    testMutation(a, b);
-    testMutation(b, a);
-  };
-
-  testBothWays(["a", "b", "c"], ["c", "b", "a"]);
-  testBothWays(["a", "b", "c"], []);
-  testBothWays(["a", "b", "c"], ["e","f"]);
-  testBothWays(["a", "b", "c", "d"], ["c", "b", "a"]);
-  testBothWays(['A','B','C','D','E','F','G','H','I'],
-               ['A','B','F','G','C','D','I','L','M','N','H']);
-  testBothWays(['A','B','C','D','E','F','G','H','I'],['A','B','C','D','F','G','H','E','I']);
-});
-
-Tinytest.add("minimongo - diff", function (test) {
-
-  // test correctness
-
-  var diffTest = function(origLen, newOldIdx) {
-    var oldResults = new Array(origLen);
-    for (var i = 1; i <= origLen; i++)
-      oldResults[i-1] = {_id: i};
-
-    var newResults = _.map(newOldIdx, function(n) {
-      var doc = {_id: Math.abs(n)};
-      if (n < 0)
-        doc.changed = true;
-      return doc;
-    });
-    var find = function (arr, id) {
-      for (var i = 0; i < arr.length; i++) {
-        if (EJSON.equals(arr[i]._id, id))
-          return i;
-      }
-      return -1;
-    };
-
-    var results = _.clone(oldResults);
-    var observer = {
-      addedBefore: function(id, fields, before) {
-        var before_idx;
-        if (before === null)
-          before_idx = results.length;
-        else
-          before_idx = find (results, before);
-        var doc = _.extend({_id: id}, fields);
-        test.isFalse(before_idx < 0 || before_idx > results.length);
-        results.splice(before_idx, 0, doc);
-      },
-      removed: function(id) {
-        var at_idx = find (results, id);
-        test.isFalse(at_idx < 0 || at_idx >= results.length);
-        results.splice(at_idx, 1);
-      },
-      changed: function(id, fields) {
-        var at_idx = find (results, id);
-        var oldDoc = results[at_idx];
-        var doc = EJSON.clone(oldDoc);
-        LocalCollection._applyChanges(doc, fields);
-        test.isFalse(at_idx < 0 || at_idx >= results.length);
-        test.equal(doc._id, oldDoc._id);
-        results[at_idx] = doc;
-      },
-      movedBefore: function(id, before) {
-        var old_idx = find(results, id);
-        var new_idx;
-        if (before === null)
-          new_idx = results.length;
-        else
-          new_idx = find (results, before);
-        if (new_idx > old_idx)
-          new_idx--;
-        test.isFalse(old_idx < 0 || old_idx >= results.length);
-        test.isFalse(new_idx < 0 || new_idx >= results.length);
-        results.splice(new_idx, 0, results.splice(old_idx, 1)[0]);
-      }
-    };
-
-    LocalCollection._diffQueryOrderedChanges(oldResults, newResults, observer);
-    test.equal(results, newResults);
-  };
-
-  // edge cases and cases run into during debugging
-  diffTest(5, [5, 1, 2, 3, 4]);
-  diffTest(0, [1, 2, 3, 4]);
-  diffTest(4, []);
-  diffTest(7, [4, 5, 6, 7, 1, 2, 3]);
-  diffTest(7, [5, 6, 7, 1, 2, 3, 4]);
-  diffTest(10, [7, 4, 11, 6, 12, 1, 5]);
-  diffTest(3, [3, 2, 1]);
-  diffTest(10, [2, 7, 4, 6, 11, 3, 8, 9]);
-  diffTest(0, []);
-  diffTest(1, []);
-  diffTest(0, [1]);
-  diffTest(1, [1]);
-  diffTest(5, [1, 2, 3, 4, 5]);
-
-  // interaction between "changed" and other ops
-  diffTest(5, [-5, -1, 2, -3, 4]);
-  diffTest(7, [-4, -5, 6, 7, -1, 2, 3]);
-  diffTest(7, [5, 6, -7, 1, 2, -3, 4]);
-  diffTest(10, [7, -4, 11, 6, 12, -1, 5]);
-  diffTest(3, [-3, -2, -1]);
-  diffTest(10, [-2, 7, 4, 6, 11, -3, -8, 9]);
-});
-
-
 Tinytest.add("minimongo - saveOriginals", function (test) {
   // set up some data
-  var c = new LocalCollection();
+  var c = new LocalCollection(),
+      count;
   c.insert({_id: 'foo', x: 'untouched'});
   c.insert({_id: 'bar', x: 'updateme'});
   c.insert({_id: 'baz', x: 'updateme'});
@@ -1945,21 +2561,24 @@ Tinytest.add("minimongo - saveOriginals", function (test) {
   c.saveOriginals();
   c.insert({_id: "hooray", z: 'insertme'});
   c.remove({y: 'removeme'});
-  c.update({x: 'updateme'}, {$set: {z: 5}}, {multi: true});
+  count = c.update({x: 'updateme'}, {$set: {z: 5}}, {multi: true});
   c.update('bar', {$set: {k: 7}});  // update same doc twice
+
+  // Verify returned count is correct
+  test.equal(count, 2);
 
   // Verify the originals.
   var originals = c.retrieveOriginals();
   var affected = ['bar', 'baz', 'quux', 'whoa', 'hooray'];
-  test.equal(_.size(originals), _.size(affected));
+  test.equal(originals.size(), _.size(affected));
   _.each(affected, function (id) {
-    test.isTrue(_.has(originals, id));
+    test.isTrue(originals.has(id));
   });
-  test.equal(originals.bar, {_id: 'bar', x: 'updateme'});
-  test.equal(originals.baz, {_id: 'baz', x: 'updateme'});
-  test.equal(originals.quux, {_id: 'quux', y: 'removeme'});
-  test.equal(originals.whoa, {_id: 'whoa', y: 'removeme'});
-  test.equal(originals.hooray, undefined);
+  test.equal(originals.get('bar'), {_id: 'bar', x: 'updateme'});
+  test.equal(originals.get('baz'), {_id: 'baz', x: 'updateme'});
+  test.equal(originals.get('quux'), {_id: 'quux', y: 'removeme'});
+  test.equal(originals.get('whoa'), {_id: 'whoa', y: 'removeme'});
+  test.equal(originals.get('hooray'), undefined);
 
   // Verify that changes actually occured.
   test.equal(c.find().count(), 4);
@@ -1972,16 +2591,16 @@ Tinytest.add("minimongo - saveOriginals", function (test) {
   c.saveOriginals();
   originals = c.retrieveOriginals();
   test.isTrue(originals);
-  test.isTrue(_.isEmpty(originals));
+  test.isTrue(originals.empty());
 
   // Insert and remove a document during the period.
   c.saveOriginals();
   c.insert({_id: 'temp', q: 8});
   c.remove('temp');
   originals = c.retrieveOriginals();
-  test.equal(_.size(originals), 1);
-  test.isTrue(_.has(originals, 'temp'));
-  test.equal(originals.temp, undefined);
+  test.equal(originals.size(), 1);
+  test.isTrue(originals.has('temp'));
+  test.equal(originals.get('temp'), undefined);
 });
 
 Tinytest.add("minimongo - saveOriginals errors", function (test) {
@@ -1995,27 +2614,27 @@ Tinytest.add("minimongo - saveOriginals errors", function (test) {
 
 Tinytest.add("minimongo - objectid transformation", function (test) {
   var testId = function (item) {
-    test.equal(item, LocalCollection._idParse(LocalCollection._idStringify(item)));
+    test.equal(item, MongoID.idParse(MongoID.idStringify(item)));
   };
-  var randomOid = new LocalCollection._ObjectID();
+  var randomOid = new MongoID.ObjectID();
   testId(randomOid);
   testId("FOO");
   testId("ffffffffffff");
   testId("0987654321abcdef09876543");
-  testId(new LocalCollection._ObjectID());
+  testId(new MongoID.ObjectID());
   testId("--a string");
 
-  test.equal("ffffffffffff", LocalCollection._idParse(LocalCollection._idStringify("ffffffffffff")));
+  test.equal("ffffffffffff", MongoID.idParse(MongoID.idStringify("ffffffffffff")));
 });
 
 
 Tinytest.add("minimongo - objectid", function (test) {
-  var randomOid = new LocalCollection._ObjectID();
-  var anotherRandomOid = new LocalCollection._ObjectID();
+  var randomOid = new MongoID.ObjectID();
+  var anotherRandomOid = new MongoID.ObjectID();
   test.notEqual(randomOid, anotherRandomOid);
-  test.throws(function() { new LocalCollection._ObjectID("qqqqqqqqqqqqqqqqqqqqqqqq");});
-  test.throws(function() { new LocalCollection._ObjectID("ABCDEF"); });
-  test.equal(randomOid, new LocalCollection._ObjectID(randomOid.valueOf()));
+  test.throws(function() { new MongoID.ObjectID("qqqqqqqqqqqqqqqqqqqqqqqq");});
+  test.throws(function() { new MongoID.ObjectID("ABCDEF"); });
+  test.equal(randomOid, new MongoID.ObjectID(randomOid.valueOf()));
 });
 
 Tinytest.add("minimongo - pause", function (test) {
@@ -2050,6 +2669,14 @@ Tinytest.add("minimongo - pause", function (test) {
   test.equal(operations.shift(), ['changed', {a:3}, 0, {a:1}]);
   test.length(operations, 0);
 
+  // test special case for remove({})
+  c.pauseObservers();
+  test.equal(c.remove({}), 1);
+  test.length(operations, 0);
+  c.resumeObservers();
+  test.equal(operations.shift(), ['removed', 1, 0, {a:3}]);
+  test.length(operations, 0);
+
   h.stop();
 });
 
@@ -2061,7 +2688,7 @@ Tinytest.add("minimongo - ids matched by selector", function (test) {
   };
   check("foo", ["foo"]);
   check({_id: "foo"}, ["foo"]);
-  var oid1 = new LocalCollection._ObjectID();
+  var oid1 = new MongoID.ObjectID();
   check(oid1, [oid1]);
   check({_id: oid1}, [oid1]);
   check({_id: "foo", x: 42}, ["foo"]);
@@ -2090,7 +2717,7 @@ Tinytest.add("minimongo - reactive stop", function (test) {
   var x, y;
   var sortOrder = ReactiveVar(1);
 
-  var c = Deps.autorun(function () {
+  var c = Tracker.autorun(function () {
     var q = coll.find({}, {sort: {_id: sortOrder.get()}});
     x = "";
     q.observe({ addedAt: function (doc, atIndex, before) {
@@ -2108,7 +2735,7 @@ Tinytest.add("minimongo - reactive stop", function (test) {
   sortOrder.set(-1);
   test.equal(x, "ABC");
   test.equal(y, "ABC");
-  Deps.flush();
+  Tracker.flush();
   test.equal(x, "CBA");
   test.equal(y, "CBA");
 
@@ -2134,7 +2761,7 @@ Tinytest.add("minimongo - immediate invalidate", function (test) {
   // recomputed, then recompute them one by one, without checking to see if the
   // callbacks from recomputing one query stopped the second query, which
   // crashed.
-  var c = Deps.autorun(function () {
+  var c = Tracker.autorun(function () {
     coll.findOne('A');
     coll.findOne('A');
   });
@@ -2153,7 +2780,7 @@ Tinytest.add("minimongo - count on cursor with limit", function(test){
   coll.insert({_id: 'C'});
   coll.insert({_id: 'D'});
 
-  var c = Deps.autorun(function (c) {
+  var c = Tracker.autorun(function (c) {
     var cursor = coll.find({_id: {$exists: true}}, {sort: {_id: 1}, limit: 3});
     count = cursor.count();
   });
@@ -2161,22 +2788,261 @@ Tinytest.add("minimongo - count on cursor with limit", function(test){
   test.equal(count, 3);
 
   coll.remove('A'); // still 3 in the collection
-  Deps.flush();
+  Tracker.flush();
   test.equal(count, 3);
 
   coll.remove('B'); // expect count now 2
-  Deps.flush();
+  Tracker.flush();
   test.equal(count, 2);
 
 
   coll.insert({_id: 'A'}); // now 3 again
-  Deps.flush();
+  Tracker.flush();
   test.equal(count, 3);
 
   coll.insert({_id: 'B'}); // now 4 entries, but count should be 3 still
-  Deps.flush();
+  Tracker.flush();
   test.equal(count, 3);
 
   c.stop();
+});
 
+Tinytest.add("minimongo - reactive count with cached cursor", function (test) {
+  var coll = new LocalCollection;
+  var cursor = coll.find({});
+  var firstAutorunCount, secondAutorunCount;
+  Tracker.autorun(function(){
+    firstAutorunCount = cursor.count();
+  });
+  Tracker.autorun(function(){
+    secondAutorunCount = coll.find({}).count();
+  });
+  test.equal(firstAutorunCount, 0);
+  test.equal(secondAutorunCount, 0);
+  coll.insert({i: 1});
+  coll.insert({i: 2});
+  coll.insert({i: 3});
+  Tracker.flush();
+  test.equal(firstAutorunCount, 3);
+  test.equal(secondAutorunCount, 3);
+});
+
+Tinytest.add("minimongo - $near operator tests", function (test) {
+  var coll = new LocalCollection();
+  coll.insert({ rest: { loc: [2, 3] } });
+  coll.insert({ rest: { loc: [-3, 3] } });
+  coll.insert({ rest: { loc: [5, 5] } });
+
+  test.equal(coll.find({ 'rest.loc': { $near: [0, 0], $maxDistance: 30 } }).count(), 3);
+  test.equal(coll.find({ 'rest.loc': { $near: [0, 0], $maxDistance: 4 } }).count(), 1);
+  var points = coll.find({ 'rest.loc': { $near: [0, 0], $maxDistance: 6 } }).fetch();
+  _.each(points, function (point, i, points) {
+    test.isTrue(!i || distance([0, 0], point.rest.loc) >= distance([0, 0], points[i - 1].rest.loc));
+  });
+
+  function distance(a, b) {
+    var x = a[0] - b[0];
+    var y = a[1] - b[1];
+    return Math.sqrt(x * x + y * y);
+  }
+
+  // GeoJSON tests
+  coll = new LocalCollection();
+  var data = [{ "category" : "BURGLARY", "descript" : "BURGLARY OF STORE, FORCIBLE ENTRY", "address" : "100 Block of 10TH ST", "location" : { "type" : "Point", "coordinates" : [  -122.415449723856,  37.7749518087273 ] } },
+    { "category" : "WEAPON LAWS", "descript" : "POSS OF PROHIBITED WEAPON", "address" : "900 Block of MINNA ST", "location" : { "type" : "Point", "coordinates" : [  -122.415386041221,  37.7747879744156 ] } },
+    { "category" : "LARCENY/THEFT", "descript" : "GRAND THEFT OF PROPERTY", "address" : "900 Block of MINNA ST", "location" : { "type" : "Point", "coordinates" : [  -122.41538270191,  37.774683628213 ] } },
+    { "category" : "LARCENY/THEFT", "descript" : "PETTY THEFT FROM LOCKED AUTO", "address" : "900 Block of MINNA ST", "location" : { "type" : "Point", "coordinates" : [  -122.415396041221,  37.7747879744156 ] } },
+    { "category" : "OTHER OFFENSES", "descript" : "POSSESSION OF BURGLARY TOOLS", "address" : "900 Block of MINNA ST", "location" : { "type" : "Point", "coordinates" : [  -122.415386041221,  37.7747879734156 ] } }
+  ];
+
+  _.each(data, function (x, i) { coll.insert(_.extend(x, { x: i })); });
+
+  var close15 = coll.find({ location: { $near: {
+    $geometry: { type: "Point",
+                 coordinates: [-122.4154282, 37.7746115] },
+    $maxDistance: 15 } } }).fetch();
+  test.length(close15, 1);
+  test.equal(close15[0].descript, "GRAND THEFT OF PROPERTY");
+
+  var close20 = coll.find({ location: { $near: {
+    $geometry: { type: "Point",
+                 coordinates: [-122.4154282, 37.7746115] },
+    $maxDistance: 20 } } }).fetch();
+  test.length(close20, 4);
+  test.equal(close20[0].descript, "GRAND THEFT OF PROPERTY");
+  test.equal(close20[1].descript, "PETTY THEFT FROM LOCKED AUTO");
+  test.equal(close20[2].descript, "POSSESSION OF BURGLARY TOOLS");
+  test.equal(close20[3].descript, "POSS OF PROHIBITED WEAPON");
+
+  // Any combinations of $near with $or/$and/$nor/$not should throw an error
+  test.throws(function () {
+    coll.find({ location: {
+      $not: {
+        $near: {
+          $geometry: {
+            type: "Point",
+            coordinates: [-122.4154282, 37.7746115]
+          }, $maxDistance: 20 } } } });
+  });
+  test.throws(function () {
+    coll.find({
+      $and: [ { location: { $near: { $geometry: { type: "Point", coordinates: [-122.4154282, 37.7746115] }, $maxDistance: 20 }}},
+              { x: 0 }]
+    });
+  });
+  test.throws(function () {
+    coll.find({
+      $or: [ { location: { $near: { $geometry: { type: "Point", coordinates: [-122.4154282, 37.7746115] }, $maxDistance: 20 }}},
+             { x: 0 }]
+    });
+  });
+  test.throws(function () {
+    coll.find({
+      $nor: [ { location: { $near: { $geometry: { type: "Point", coordinates: [-122.4154282, 37.7746115] }, $maxDistance: 1 }}},
+              { x: 0 }]
+    });
+  });
+  test.throws(function () {
+    coll.find({
+      $and: [{
+        $and: [{
+          location: {
+            $near: {
+              $geometry: {
+                type: "Point",
+                coordinates: [-122.4154282, 37.7746115]
+              },
+              $maxDistance: 1
+            }
+          }
+        }]
+      }]
+    });
+  });
+
+  // array tests
+  coll = new LocalCollection();
+  coll.insert({
+    _id: "x",
+    k: 9,
+    a: [
+      {b: [
+        [100, 100],
+        [1,  1]]},
+      {b: [150,  150]}]});
+  coll.insert({
+    _id: "y",
+    k: 9,
+    a: {b: [5, 5]}});
+  var testNear = function (near, md, expected) {
+    test.equal(
+      _.pluck(
+        coll.find({'a.b': {$near: near, $maxDistance: md}}).fetch(), '_id'),
+      expected);
+  };
+  testNear([149, 149], 4, ['x']);
+  testNear([149, 149], 1000, ['x', 'y']);
+  // It's important that we figure out that 'x' is closer than 'y' to [2,2] even
+  // though the first within-1000 point in 'x' (ie, [100,100]) is farther than
+  // 'y'.
+  testNear([2, 2], 1000, ['x', 'y']);
+
+  // Ensure that distance is used as a tie-breaker for sort.
+  test.equal(
+    _.pluck(coll.find({'a.b': {$near: [1, 1]}}, {sort: {k: 1}}).fetch(), '_id'),
+    ['x', 'y']);
+  test.equal(
+    _.pluck(coll.find({'a.b': {$near: [5, 5]}}, {sort: {k: 1}}).fetch(), '_id'),
+    ['y', 'x']);
+
+  var operations = [];
+  var cbs = log_callbacks(operations);
+  var handle = coll.find({'a.b': {$near: [7,7]}}).observe(cbs);
+
+  test.length(operations, 2);
+  test.equal(operations.shift(), ['added', {k:9, a:{b:[5,5]}}, 0, null]);
+  test.equal(operations.shift(),
+             ['added', {k: 9, a:[{b:[[100,100],[1,1]]},{b:[150,150]}]},
+              1, null]);
+  // This needs to be inserted in the MIDDLE of the two existing ones.
+  coll.insert({a: {b: [3,3]}});
+  test.length(operations, 1);
+  test.equal(operations.shift(), ['added', {a: {b: [3, 3]}}, 1, 'x']);
+
+  handle.stop();
+});
+
+// Regression test for #4377. Previously, "replace" updates didn't clone the
+// argument.
+Tinytest.add("minimongo - update should clone", function (test) {
+  var x = [];
+  var coll = new LocalCollection;
+  var id = coll.insert({});
+  coll.update(id, {x: x});
+  x.push(1);
+  test.equal(coll.findOne(id), {_id: id, x: []});
+});
+
+// See #2275.
+Tinytest.add("minimongo - fetch in observe", function (test) {
+  var coll = new LocalCollection;
+  var callbackInvoked = false;
+  var observe = coll.find().observeChanges({
+    added: function (id, fields) {
+      callbackInvoked = true;
+      test.equal(fields, {foo: 1});
+      var doc = coll.findOne({foo: 1});
+      test.isTrue(doc);
+      test.equal(doc.foo, 1);
+    }
+  });
+  test.isFalse(callbackInvoked);
+  var computation = Tracker.autorun(function (computation) {
+    if (computation.firstRun) {
+      coll.insert({foo: 1});
+    }
+  });
+  test.isTrue(callbackInvoked);
+  observe.stop();
+  computation.stop();
+});
+
+// See #2254
+Tinytest.add("minimongo - fine-grained reactivity of observe with fields projection", function (test) {
+  var X = new LocalCollection;
+  var id = "asdf";
+  X.insert({_id: id, foo: {bar: 123}});
+
+  var callbackInvoked = false;
+  var obs = X.find(id, {fields: {'foo.bar': 1}}).observeChanges({
+    changed: function (id, fields) {
+      callbackInvoked = true;
+    }
+  });
+
+  test.isFalse(callbackInvoked);
+  X.update(id, {$set: {'foo.baz': 456}});
+  test.isFalse(callbackInvoked);
+
+  obs.stop();
+});
+Tinytest.add("minimongo - fine-grained reactivity of query with fields projection", function (test) {
+  var X = new LocalCollection;
+  var id = "asdf";
+  X.insert({_id: id, foo: {bar: 123}});
+
+  var callbackInvoked = false;
+  var computation = Tracker.autorun(function () {
+    callbackInvoked = true;
+    return X.findOne(id, { fields: { 'foo.bar': 1 } });
+  });
+  test.isTrue(callbackInvoked);
+  callbackInvoked = false;
+  X.update(id, {$set: {'foo.baz': 456}});
+  test.isFalse(callbackInvoked);
+  X.update(id, {$set: {'foo.bar': 124}});
+  Tracker.flush();
+  test.isTrue(callbackInvoked);
+
+  computation.stop();
 });

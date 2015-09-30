@@ -1,9 +1,14 @@
-simulateEvent = function (node, event, args) {
+// possible options:
+// bubbles: A boolean indicating whether the event should bubble up through
+//  the event chain or not. (default is true)
+simulateEvent = function (node, event, args, options) {
   node = (node instanceof $ ? node[0] : node);
+
+  var bubbles = (options && "bubbles" in options) ? options.bubbles : true;
 
   if (document.createEvent) {
     var e = document.createEvent("Event");
-    e.initEvent(event, true, true);
+    e.initEvent(event, bubbles, true);
     _.extend(e, args);
     node.dispatchEvent(e);
   } else {
@@ -37,3 +42,25 @@ clickElement = function(elem) {
   else
     simulateEvent(elem, 'click');
 };
+
+var inDocument = function (elem) {
+  while ((elem = elem.parentNode)) {
+    if (elem == document) {
+      return true;
+    }
+  }
+  return false;
+};
+
+clickIt = function (elem) {
+  if (!inDocument(elem))
+    throw new Error("Can't click on elements without first adding them to the document");
+
+  // jQuery's bubbling change event polyfill for IE 8 seems
+  // to require that the element in question have focus when
+  // it receives a simulated click.
+  if (elem.focus)
+    elem.focus();
+  clickElement(elem);
+};
+

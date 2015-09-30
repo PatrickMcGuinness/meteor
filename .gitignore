@@ -3,6 +3,10 @@
 *~
 /dev_bundle
 /dev_bundle*.tar.gz
+/android_bundle
+/android_bundle*.tar.gz
+/node_*.tar.gz
+/mongo_*.tar.gz
 /dist
 \#*\#
 .\#*
@@ -14,3 +18,6 @@ TAGS
 *.log
 *.out
 npm-debug.log
+universe
+.babel-cache
+mongo-test-output

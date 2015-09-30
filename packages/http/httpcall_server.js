@@ -2,6 +2,15 @@ var path = Npm.require('path');
 var request = Npm.require('request');
 var url_util = Npm.require('url');
 
+HTTPInternals = {
+  NpmModules: {
+    request: {
+      version: Npm.require('request/package.json').version,
+      module: request
+    }
+  }
+};
+
 // _call always runs asynchronously; HTTP.call, defined below,
 // wraps _call and runs synchronously when no callback is provided.
 var _call = function(method, url, options, callback) {
@@ -16,12 +25,14 @@ var _call = function(method, url, options, callback) {
 
   options = options || {};
 
+  if (_.has(options, 'beforeSend')) {
+    throw new Error("Option beforeSend not supported on server.");
+  }
+
   method = (method || "").toUpperCase();
 
   if (! /^https?:\/\//.test(url))
     throw new Error("url must be absolute and start with http:// or https://");
-
-  var url_parts = url_util.parse(url);
 
   var headers = {};
 
@@ -32,15 +43,13 @@ var _call = function(method, url, options, callback) {
   }
 
 
-  var params_for_url, params_for_body;
+  var paramsForUrl, paramsForBody;
   if (content || method === "GET" || method === "HEAD")
-    params_for_url = options.params;
+    paramsForUrl = options.params;
   else
-    params_for_body = options.params;
+    paramsForBody = options.params;
 
-  var new_url = buildUrl(
-    url_parts.protocol + "//" + url_parts.host + url_parts.pathname,
-    url_parts.search, options.query, params_for_url);
+  var newUrl = URL._constructUrl(url, options.query, paramsForUrl);
 
   if (options.auth) {
     if (options.auth.indexOf(':') < 0)
@@ -49,8 +58,8 @@ var _call = function(method, url, options, callback) {
       (new Buffer(options.auth, "ascii")).toString("base64");
   }
 
-  if (params_for_body) {
-    content = encodeParams(params_for_body);
+  if (paramsForBody) {
+    content = URL._encodeParams(paramsForBody);
     headers['Content-Type'] = "application/x-www-form-urlencoded";
   }
 
@@ -72,18 +81,23 @@ var _call = function(method, url, options, callback) {
 
   ////////// Kickoff! //////////
 
-  var req_options = {
-    url: new_url,
+  // Allow users to override any request option with the npmRequestOptions
+  // option.
+  var reqOptions = _.extend({
+    url: newUrl,
     method: method,
     encoding: "utf8",
     jar: false,
     timeout: options.timeout,
     body: content,
     followRedirect: options.followRedirects,
+    // Follow redirects on non-GET requests
+    // also. (https://github.com/meteor/meteor/issues/2808)
+    followAllRedirects: options.followRedirects,
     headers: headers
-  };
+  }, options.npmRequestOptions || {});
 
-  request(req_options, function(error, res, body) {
+  request(reqOptions, function(error, res, body) {
     var response = null;
 
     if (! error) {
@@ -104,4 +118,4 @@ var _call = function(method, url, options, callback) {
   });
 };
 
-HTTP.call = Meteor._wrapAsync(_call);
+HTTP.call = Meteor.wrapAsync(_call);

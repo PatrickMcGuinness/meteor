@@ -1,39 +1,114 @@
 {
   "dependencies": {
-    "clean-css": {
-      "version": "1.0.11",
+    "css-parse": {
+      "version": "2.0.0",
       "dependencies": {
-        "commander": {
-          "version": "1.2.0",
+        "css": {
+          "version": "2.2.0",
           "dependencies": {
-            "keypress": {
+            "source-map": {
+              "version": "0.1.43",
+              "dependencies": {
+                "amdefine": {
+                  "version": "0.1.1"
+                }
+              }
+            },
+            "source-map-resolve": {
+              "version": "0.3.1",
+              "dependencies": {
+                "source-map-url": {
+                  "version": "0.3.0"
+                },
+                "atob": {
+                  "version": "1.1.2"
+                },
+                "resolve-url": {
+                  "version": "0.2.1"
+                }
+              }
+            },
+            "urix": {
               "version": "0.1.0"
+            },
+            "inherits": {
+              "version": "2.0.1"
+            }
+          }
+        }
+      }
+    },
+    "css-stringify": {
+      "version": "2.0.0",
+      "dependencies": {
+        "css": {
+          "version": "2.2.0",
+          "dependencies": {
+            "source-map": {
+              "version": "0.1.43",
+              "dependencies": {
+                "amdefine": {
+                  "version": "0.1.1"
+                }
+              }
+            },
+            "source-map-resolve": {
+              "version": "0.3.1",
+              "dependencies": {
+                "source-map-url": {
+                  "version": "0.3.0"
+                },
+                "atob": {
+                  "version": "1.1.2"
+                },
+                "resolve-url": {
+                  "version": "0.2.1"
+                }
+              }
+            },
+            "urix": {
+              "version": "0.1.0"
+            },
+            "inherits": {
+              "version": "2.0.1"
             }
           }
         }
       }
     },
     "uglify-js": {
-      "from": "https://github.com/mishoo/UglifyJS2/tarball/b1febde3e9be32b9d88918ed733efc3796e3f143",
+      "version": "2.4.20",
       "dependencies": {
         "async": {
-          "version": "0.2.9"
+          "version": "0.2.10"
         },
         "source-map": {
-          "version": "0.1.26",
+          "version": "0.1.34",
           "dependencies": {
             "amdefine": {
-              "version": "0.0.5"
+              "version": "0.1.0"
             }
           }
         },
-        "optimist": {
-          "version": "0.3.7",
+        "yargs": {
+          "version": "3.5.4",
           "dependencies": {
+            "camelcase": {
+              "version": "1.0.2"
+            },
+            "decamelize": {
+              "version": "1.0.0"
+            },
+            "window-size": {
+              "version": "0.1.0"
+            },
             "wordwrap": {
               "version": "0.0.2"
             }
           }
+        },
+        "uglify-to-browserify": {
+          "version": "1.0.2"
         }
       }
     }

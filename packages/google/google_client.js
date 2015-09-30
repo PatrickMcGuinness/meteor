@@ -16,36 +16,64 @@ Google.requestCredential = function (options, credentialRequestCompleteCallback)
 
   var config = ServiceConfiguration.configurations.findOne({service: 'google'});
   if (!config) {
-    credentialRequestCompleteCallback && credentialRequestCompleteCallback(new ServiceConfiguration.ConfigError("Service not configured"));
+    credentialRequestCompleteCallback && credentialRequestCompleteCallback(
+      new ServiceConfiguration.ConfigError());
     return;
   }
 
-  var credentialToken = Random.id();
+  var credentialToken = Random.secret();
 
   // always need this to get user id from google.
-  var requiredScope = ['https://www.googleapis.com/auth/userinfo.profile'];
-  var scope = ['https://www.googleapis.com/auth/userinfo.email'];
+  var requiredScope = ['profile'];
+  var scope = ['email'];
   if (options.requestPermissions)
     scope = options.requestPermissions;
   scope = _.union(scope, requiredScope);
-  var flatScope = _.map(scope, encodeURIComponent).join('+');
 
+  var loginUrlParameters = {};
+  if (config.loginUrlParameters){
+    _.extend(loginUrlParameters, config.loginUrlParameters)
+  }
+  if (options.loginUrlParameters){
+    _.extend(loginUrlParameters, options.loginUrlParameters)
+  }
+  var ILLEGAL_PARAMETERS = ['response_type', 'client_id', 'scope', 'redirect_uri', 'state'];
+    // validate options keys
+  _.each(_.keys(loginUrlParameters), function (key) {
+    if (_.contains(ILLEGAL_PARAMETERS, key))
+      throw new Error("Google.requestCredential: Invalid loginUrlParameter: " + key);
+  });
+
+  // backwards compatible options
+  if (options.requestOfflineToken != null){
+    loginUrlParameters.access_type = options.requestOfflineToken ? 'offline' : 'online'
+  }
+  if (options.prompt != null) {
+    loginUrlParameters.prompt = options.prompt;
+  } else if (options.forceApprovalPrompt) {
+    loginUrlParameters.prompt = 'consent'
+  }
+
+  var loginStyle = OAuth._loginStyle('google', config, options);
   // https://developers.google.com/accounts/docs/OAuth2WebServer#formingtheurl
-  var accessType = options.requestOfflineToken ? 'offline' : 'online';
-  var approvalPrompt = options.forceApprovalPrompt ? 'force' : 'auto';
+  _.extend(loginUrlParameters, {
+    "response_type": "code",
+    "client_id":  config.clientId,
+    "scope": scope.join(' '), // space delimited
+    "redirect_uri": OAuth._redirectUri('google', config),
+    "state": OAuth._stateParam(loginStyle, credentialToken, options.redirectUrl)
+  });
+  var loginUrl = 'https://accounts.google.com/o/oauth2/auth?' +
+    _.map(loginUrlParameters, function(value, param){
+      return encodeURIComponent(param) + '=' + encodeURIComponent(value);
+    }).join("&");
 
-  var loginUrl =
-        'https://accounts.google.com/o/oauth2/auth' +
-        '?response_type=code' +
-        '&client_id=' + config.clientId +
-        '&scope=' + flatScope +
-        '&redirect_uri=' + Meteor.absoluteUrl('_oauth/google?close') +
-        '&state=' + credentialToken +
-        '&access_type=' + accessType +
-        '&approval_prompt=' + approvalPrompt;
-
-  Oauth.initiateLogin(credentialToken,
-                      loginUrl,
-                      credentialRequestCompleteCallback,
-                      { height: 406 });
+  OAuth.launchLogin({
+    loginService: "google",
+    loginStyle: loginStyle,
+    loginUrl: loginUrl,
+    credentialRequestCompleteCallback: credentialRequestCompleteCallback,
+    credentialToken: credentialToken,
+    popupOptions: { height: 600 }
+  });
 };

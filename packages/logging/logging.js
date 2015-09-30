@@ -51,7 +51,7 @@ var META_COLOR = 'blue';
 
 // XXX package
 var RESTRICTED_KEYS = ['time', 'timeInexact', 'level', 'file', 'line',
-                        'program', 'originApp', 'stderr'];
+                        'program', 'originApp', 'satellite', 'stderr'];
 
 var FORMATTED_KEYS = RESTRICTED_KEYS.concat(['app', 'message']);
 
@@ -97,8 +97,7 @@ Log._getCallerDetails = function () {
       return {file: "eval"};
     }
 
-    // XXX probably wants to be / or .js in case no source maps
-    if (!line.match(/packages\/logging(?:\/|(?::tests)?\.js)/))
+    if (!line.match(/packages\/(?:local-test[:_])?logging(?:\/|\.js)/))
       break;
   }
 
@@ -145,8 +144,8 @@ _.each(['debug', 'info', 'warn', 'error'], function (level) {
 
     if (_.has(obj, 'message') && !_.isString(obj.message))
       throw new Error("The 'message' field in log objects must be a string");
-
-    obj = _.extend(Log._getCallerDetails(), obj);
+    if (!obj.omitCallerDetails)
+      obj = _.extend(Log._getCallerDetails(), obj);
     obj.time = new Date();
     obj.level = level;
 
@@ -202,6 +201,7 @@ Log.format = function (obj, options) {
   var originApp = obj.originApp;
   var message = obj.message || '';
   var program = obj.program || '';
+  var satellite = obj.satellite;
   var stderr = obj.stderr || '';
 
   _.each(FORMATTED_KEYS, function(key) {
@@ -213,10 +213,10 @@ Log.format = function (obj, options) {
     message += EJSON.stringify(obj);
   }
 
-  var pad2 = function(n) { return n < 10 ? '0' + n : n; };
-  var pad3 = function(n) { return n < 100 ? '0' + pad2(n) : n; };
+  var pad2 = function(n) { return n < 10 ? '0' + n : n.toString(); };
+  var pad3 = function(n) { return n < 100 ? '0' + pad2(n) : n.toString(); };
 
-  var dateStamp = time.getFullYear() +
+  var dateStamp = time.getFullYear().toString() +
     pad2(time.getMonth() + 1 /*0-based*/) +
     pad2(time.getDate());
   var timeStamp = pad2(time.getHours()) +
@@ -235,9 +235,15 @@ Log.format = function (obj, options) {
   if (originApp && originApp !== appName) appInfo += ' via ' + originApp;
   if (appInfo) appInfo = '[' + appInfo + '] ';
 
-  var sourceInfo = (file && lineNumber) ?
-      ['(', (program ? program + ':' : ''), file, ':', lineNumber, ') '].join('')
-      : '';
+  var sourceInfoParts = [];
+  if (program) sourceInfoParts.push(program);
+  if (file) sourceInfoParts.push(file);
+  if (lineNumber) sourceInfoParts.push(lineNumber);
+  var sourceInfo = _.isEmpty(sourceInfoParts) ?
+    '' : '(' + sourceInfoParts.join(':') + ') ';
+
+  if (satellite)
+    sourceInfo += ['[', satellite, ']'].join('');
 
   var stderrIndicator = stderr ? '(STDERR) ' : '';
 
@@ -257,8 +263,8 @@ Log.format = function (obj, options) {
       Npm.require('cli-color')[color](line) : line;
   };
 
-  return prettify(metaPrefix, META_COLOR)
-    + prettify(message, LEVEL_COLORS[level]);
+  return prettify(metaPrefix, options.metaColor || META_COLOR) +
+    prettify(message, LEVEL_COLORS[level]);
 };
 
 // Turn a line of text into a loggable object.

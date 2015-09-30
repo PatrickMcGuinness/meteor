@@ -2,66 +2,51 @@ var crypto = Npm.require('crypto');
 var fs = Npm.require('fs');
 var path = Npm.require('path');
 
-var knownBrowsers = [
-  'android',
-  'chrome',
-  'chromium',
-  'firefox',
-  'ie',
-  'mobileSafari',
-  'safari'
-];
-
-var browsersEnabledByDefault = [
-  'android',
-  'chrome',
-  'chromium',
-  'ie',
-  'mobileSafari',
-  'safari'
-];
-
-var enabledBrowsers = {};
-_.each(browsersEnabledByDefault, function (browser) {
-  enabledBrowsers[browser] = true;
-});
+var _disableSizeCheck = false;
 
 Meteor.AppCache = {
-  config: function(options) {
+  config: function (options) {
     _.each(options, function (value, option) {
       if (option === 'browsers') {
-        enabledBrowsers = {};
+        disabledBrowsers = {};
         _.each(value, function (browser) {
-          enabledBrowsers[browser] = true;
+          disabledBrowsers[browser] = false;
         });
-      }
-      else if (_.contains(knownBrowsers, option)) {
-        enabledBrowsers[option] = value;
       }
       else if (option === 'onlineOnly') {
         _.each(value, function (urlPrefix) {
           RoutePolicy.declare(urlPrefix, 'static-online');
         });
       }
-      else {
+      // option to suppress warnings for tests.
+      else if (option === '_disableSizeCheck') {
+        _disableSizeCheck = value;
+      }
+      else if (value === false) {
+        disabledBrowsers[option] = true;
+      }
+      else if (value === true) {
+        disabledBrowsers[option] = false;
+      } else {
         throw new Error('Invalid AppCache config option: ' + option);
       }
     });
   }
 };
 
-var browserEnabled = function(request) {
-  return enabledBrowsers[request.browser.name];
+var disabledBrowsers = {};
+var browserDisabled = function (request) {
+  return disabledBrowsers[request.browser.name];
 };
 
 WebApp.addHtmlAttributeHook(function (request) {
-  if (browserEnabled(request))
-    return 'manifest="/app.manifest"';
-  else
+  if (browserDisabled(request))
     return null;
+  else
+    return { manifest: "/app.manifest" };
 });
 
-WebApp.connectHandlers.use(function(req, res, next) {
+WebApp.connectHandlers.use(function (req, res, next) {
   if (req.url !== '/app.manifest') {
     return next();
   }
@@ -76,39 +61,41 @@ WebApp.connectHandlers.use(function(req, res, next) {
   // use").  Returning a 404 gets the browser to really turn off the
   // app cache.
 
-  if (!browserEnabled(WebApp.categorizeRequest(req))) {
+  if (browserDisabled(WebApp.categorizeRequest(req))) {
     res.writeHead(404);
     res.end();
     return;
   }
+
+  var manifest = "CACHE MANIFEST\n\n";
 
   // After the browser has downloaded the app files from the server and
   // has populated the browser's application cache, the browser will
   // *only* connect to the server and reload the application if the
   // *contents* of the app manifest file has changed.
   //
-  // So we have to ensure that if any static client resources change,
-  // something changes in the manifest file.  We compute a hash of
-  // everything that gets delivered to the client during the initial
-  // web page load, and include that hash as a comment in the app
-  // manifest.  That way if anything changes, the comment changes, and
-  // the browser will reload resources.
+  // So to ensure that the client updates if client resources change,
+  // include a hash of client resources in the manifest.
 
-  var hash = crypto.createHash('sha1');
-  hash.update(JSON.stringify(__meteor_runtime_config__), 'utf8');
-  _.each(WebApp.clientProgram.manifest, function (resource) {
-    if (resource.where === 'client' || resource.where === 'internal') {
-      hash.update(resource.hash);
-    }
-  });
-  var digest = hash.digest('hex');
+  manifest += "# " + WebApp.clientHash() + "\n";
 
-  var manifest = "CACHE MANIFEST\n\n";
-  manifest += '# ' + digest + "\n\n";
+  // When using the autoupdate package, also include
+  // AUTOUPDATE_VERSION.  Otherwise the client will get into an
+  // infinite loop of reloads when the browser doesn't fetch the new
+  // app HTML which contains the new version, and autoupdate will
+  // reload again trying to get the new code.
+
+  if (Package.autoupdate) {
+    var version = Package.autoupdate.Autoupdate.autoupdateVersion;
+    if (version !== WebApp.clientHash())
+      manifest += "# " + version + "\n";
+  }
+
+  manifest += "\n";
 
   manifest += "CACHE:" + "\n";
   manifest += "/" + "\n";
-  _.each(WebApp.clientProgram.manifest, function (resource) {
+  _.each(WebApp.clientPrograms[WebApp.defaultArch].manifest, function (resource) {
     if (resource.where === 'client' &&
         ! RoutePolicy.classify(resource.url)) {
       manifest += resource.url;
@@ -137,7 +124,7 @@ WebApp.connectHandlers.use(function(req, res, next) {
   // request to the server and have the asset served from cache by
   // specifying the full URL with hash in their code (manually, with
   // some sort of URL rewriting helper)
-  _.each(WebApp.clientProgram.manifest, function (resource) {
+  _.each(WebApp.clientPrograms[WebApp.defaultArch].manifest, function (resource) {
     if (resource.where === 'client' &&
         ! RoutePolicy.classify(resource.url) &&
         !resource.cacheable) {
@@ -171,10 +158,11 @@ WebApp.connectHandlers.use(function(req, res, next) {
   return res.end(body);
 });
 
-var sizeCheck = function() {
+var sizeCheck = function () {
   var totalSize = 0;
-  _.each(WebApp.clientProgram.manifest, function (resource) {
-    if (resource.where === 'client') {
+  _.each(WebApp.clientPrograms[WebApp.defaultArch].manifest, function (resource) {
+    if (resource.where === 'client' &&
+        ! RoutePolicy.classify(resource.url)) {
       totalSize += resource.size;
     }
   });
@@ -191,4 +179,12 @@ var sizeCheck = function() {
   }
 };
 
-sizeCheck();
+// Run the size check after user code has had a chance to run. That way,
+// the size check can take into account files that the user does not
+// want cached. Otherwise, the size check warning will still print even
+// if the user excludes their large files with
+// `Meteor.AppCache.config({onlineOnly: files})`.
+Meteor.startup(function () {
+  if (! _disableSizeCheck)
+    sizeCheck();
+});

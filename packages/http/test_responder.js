@@ -10,8 +10,10 @@ var respond = function(req, res) {
     return;
   } else if (req.url === "/fail") {
     res.statusCode = 500;
-    res.end("SOME SORT OF SERVER ERROR. " +
-            "MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. MAKE THIS VERY LONG TO MAKE SURE WE TRUNCATE. ");
+    res.end("SOME SORT OF SERVER ERROR. foo" +
+            _.times(100, function () {
+              return "MAKE THIS LONG TO TEST THAT WE TRUNCATE";
+            }).join(' '));
     return;
   } else if (req.url === "/redirect") {
     res.statusCode = 301;
@@ -29,7 +31,8 @@ var respond = function(req, res) {
     var validate = function(user, pass) {
       return user === username && pass === password;
     };
-    var checker = WebApp.__basicAuth__(validate, realm);
+    var connect = WebAppInternals.NpmModules.connect.module;
+    var checker = connect.basicAuth(validate, realm);
     var success = false;
     checker(req, res, function() {
       success = true;

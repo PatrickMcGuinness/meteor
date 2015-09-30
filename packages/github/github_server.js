@@ -1,16 +1,19 @@
 Github = {};
 
-Oauth.registerService('github', 2, null, function(query) {
+OAuth.registerService('github', 2, null, function(query) {
 
   var accessToken = getAccessToken(query);
   var identity = getIdentity(accessToken);
+  var emails = getEmails(accessToken);
+  var primaryEmail = _.findWhere(emails, {primary: true});
 
   return {
     serviceData: {
       id: identity.id,
-      accessToken: accessToken,
-      email: identity.email,
-      username: identity.login
+      accessToken: OAuth.sealSecret(accessToken),
+      email: identity.email || (primaryEmail && primaryEmail.email) || '',
+      username: identity.login,
+      emails: emails
     },
     options: {profile: {name: identity.name}}
   };
@@ -24,7 +27,7 @@ if (Meteor.release)
 var getAccessToken = function (query) {
   var config = ServiceConfiguration.configurations.findOne({service: 'github'});
   if (!config)
-    throw new ServiceConfiguration.ConfigError("Service not configured");
+    throw new ServiceConfiguration.ConfigError();
 
   var response;
   try {
@@ -37,8 +40,8 @@ var getAccessToken = function (query) {
         params: {
           code: query.code,
           client_id: config.clientId,
-          client_secret: config.secret,
-          redirect_uri: Meteor.absoluteUrl("_oauth/github?close"),
+          client_secret: OAuth.openSecret(config.secret),
+          redirect_uri: OAuth._redirectUri('github', config),
           state: query.state
         }
       });
@@ -66,7 +69,18 @@ var getIdentity = function (accessToken) {
   }
 };
 
+var getEmails = function (accessToken) {
+  try {
+    return HTTP.get(
+      "https://api.github.com/user/emails", {
+        headers: {"User-Agent": userAgent}, // http://developer.github.com/v3/#user-agent-required
+        params: {access_token: accessToken}
+      }).data;
+  } catch (err) {
+    return [];
+  }
+};
 
-Github.retrieveCredential = function(credentialToken) {
-  return Oauth.retrieveCredential(credentialToken);
+Github.retrieveCredential = function(credentialToken, credentialSecret) {
+  return OAuth.retrieveCredential(credentialToken, credentialSecret);
 };

@@ -8,42 +8,43 @@ var url = Npm.require("url");
 var crypto = Npm.require("crypto");
 
 var connect = Npm.require('connect');
-var optimist = Npm.require('optimist');
 var useragent = Npm.require('useragent');
 var send = Npm.require('send');
+
+var Future = Npm.require('fibers/future');
+var Fiber = Npm.require('fibers');
+
+var SHORT_SOCKET_TIMEOUT = 5*1000;
+var LONG_SOCKET_TIMEOUT = 120*1000;
 
 WebApp = {};
 WebAppInternals = {};
 
-// Keepalives so that when the outer server dies unceremoniously and
-// doesn't kill us, we quit ourselves. A little gross, but better than
-// pidfiles.
-// XXX This should really be part of the boot script, not the webapp package.
-//     Or we should just get rid of it, and rely on containerization.
-
-var initKeepalive = function () {
-  var keepaliveCount = 0;
-
-  process.stdin.on('data', function (data) {
-    keepaliveCount = 0;
-  });
-
-  process.stdin.resume();
-
-  setInterval(function () {
-    keepaliveCount ++;
-    if (keepaliveCount >= 3) {
-      console.log("Failed to receive keepalive! Exiting.");
-      process.exit(1);
-    }
-  }, 3000);
+WebAppInternals.NpmModules = {
+  connect: {
+    version: Npm.require('connect/package.json').version,
+    module: connect
+  }
 };
 
+WebApp.defaultArch = 'web.browser';
+
+// XXX maps archs to manifests
+WebApp.clientPrograms = {};
+
+// XXX maps archs to program path on filesystem
+var archPath = {};
+
+var bundledJsCssPrefix;
 
 var sha1 = function (contents) {
   var hash = crypto.createHash('sha1');
   hash.update(contents);
   return hash.digest('hex');
+};
+
+var readUtf8FileSync = function (filename) {
+  return Meteor.wrapAsync(fs.readFile)(filename, 'utf8');
 };
 
 // #BrowserIdentification
@@ -91,8 +92,8 @@ var camelCase = function (name) {
   return parts.join('');
 };
 
-var identifyBrowser = function (req) {
-  var userAgent = useragent.lookup(req.headers['user-agent']);
+var identifyBrowser = function (userAgentString) {
+  var userAgent = useragent.lookup(userAgentString);
   return {
     name: camelCase(userAgent.family),
     major: +userAgent.major,
@@ -101,25 +102,31 @@ var identifyBrowser = function (req) {
   };
 };
 
+// XXX Refactor as part of implementing real routing.
+WebAppInternals.identifyBrowser = identifyBrowser;
+
 WebApp.categorizeRequest = function (req) {
   return {
-    browser: identifyBrowser(req),
+    browser: identifyBrowser(req.headers['user-agent']),
     url: url.parse(req.url, true)
   };
 };
 
 // HTML attribute hooks: functions to be called to determine any attributes to
 // be added to the '<html>' tag. Each function is passed a 'request' object (see
-// #BrowserIdentification) and should return a string,
+// #BrowserIdentification) and should return null or object.
 var htmlAttributeHooks = [];
-var htmlAttributes = function (template, request) {
-  var attributes = '';
+var getHtmlAttributes = function (request) {
+  var combinedAttributes  = {};
   _.each(htmlAttributeHooks || [], function (hook) {
-    var attribute = hook(request);
-    if (attribute !== null && attribute !== undefined && attribute !== '')
-      attributes += ' ' + attribute;
+    var attributes = hook(request);
+    if (attributes === null)
+      return;
+    if (typeof attributes !== 'object')
+      throw Error("HTML attribute hook must return null or object");
+    _.extend(combinedAttributes, attributes);
   });
-  return template.replace('##HTML_ATTRIBUTES##', attributes);
+  return combinedAttributes;
 };
 WebApp.addHtmlAttributeHook = function (hook) {
   htmlAttributeHooks.push(hook);
@@ -148,19 +155,441 @@ var appUrl = function (url) {
 };
 
 
-var runWebAppServer = function () {
-  // read the control for the client we'll be serving up
-  var clientJsonPath = path.join(__meteor_bootstrap__.serverDir,
-                                 __meteor_bootstrap__.configJson.client);
-  var clientDir = path.dirname(clientJsonPath);
-  var clientJson = JSON.parse(fs.readFileSync(clientJsonPath, 'utf8'));
+// We need to calculate the client hash after all packages have loaded
+// to give them a chance to populate __meteor_runtime_config__.
+//
+// Calculating the hash during startup means that packages can only
+// populate __meteor_runtime_config__ during load, not during startup.
+//
+// Calculating instead it at the beginning of main after all startup
+// hooks had run would allow packages to also populate
+// __meteor_runtime_config__ during startup, but that's too late for
+// autoupdate because it needs to have the client hash at startup to
+// insert the auto update version itself into
+// __meteor_runtime_config__ to get it to the client.
+//
+// An alternative would be to give autoupdate a "post-start,
+// pre-listen" hook to allow it to insert the auto update version at
+// the right moment.
 
-  if (clientJson.format !== "browser-program-pre1")
-    throw new Error("Unsupported format for client assets: " +
-                    JSON.stringify(clientJson.format));
+Meteor.startup(function () {
+  var calculateClientHash = WebAppHashing.calculateClientHash;
+  WebApp.clientHash = function (archName) {
+    archName = archName || WebApp.defaultArch;
+    return calculateClientHash(WebApp.clientPrograms[archName].manifest);
+  };
+
+  WebApp.calculateClientHashRefreshable = function (archName) {
+    archName = archName || WebApp.defaultArch;
+    return calculateClientHash(WebApp.clientPrograms[archName].manifest,
+      function (name) {
+        return name === "css";
+      });
+  };
+  WebApp.calculateClientHashNonRefreshable = function (archName) {
+    archName = archName || WebApp.defaultArch;
+    return calculateClientHash(WebApp.clientPrograms[archName].manifest,
+      function (name) {
+        return name !== "css";
+      });
+  };
+  WebApp.calculateClientHashCordova = function () {
+    var archName = 'web.cordova';
+    if (! WebApp.clientPrograms[archName])
+      return 'none';
+
+    return calculateClientHash(
+      WebApp.clientPrograms[archName].manifest, null, _.pick(
+        __meteor_runtime_config__, 'PUBLIC_SETTINGS'));
+  };
+});
+
+
+
+// When we have a request pending, we want the socket timeout to be long, to
+// give ourselves a while to serve it, and to allow sockjs long polls to
+// complete.  On the other hand, we want to close idle sockets relatively
+// quickly, so that we can shut down relatively promptly but cleanly, without
+// cutting off anyone's response.
+WebApp._timeoutAdjustmentRequestCallback = function (req, res) {
+  // this is really just req.socket.setTimeout(LONG_SOCKET_TIMEOUT);
+  req.setTimeout(LONG_SOCKET_TIMEOUT);
+  // Insert our new finish listener to run BEFORE the existing one which removes
+  // the response from the socket.
+  var finishListeners = res.listeners('finish');
+  // XXX Apparently in Node 0.12 this event is now called 'prefinish'.
+  // https://github.com/joyent/node/commit/7c9b6070
+  res.removeAllListeners('finish');
+  res.on('finish', function () {
+    res.setTimeout(SHORT_SOCKET_TIMEOUT);
+  });
+  _.each(finishListeners, function (l) { res.on('finish', l); });
+};
+
+
+// Will be updated by main before we listen.
+// Map from client arch to boilerplate object.
+// Boilerplate object has:
+//   - func: XXX
+//   - baseData: XXX
+var boilerplateByArch = {};
+
+// Given a request (as returned from `categorizeRequest`), return the
+// boilerplate HTML to serve for that request. Memoizes on HTML
+// attributes (used by, eg, appcache) and whether inline scripts are
+// currently allowed.
+// XXX so far this function is always called with arch === 'web.browser'
+var memoizedBoilerplate = {};
+var getBoilerplate = function (request, arch) {
+
+  var htmlAttributes = getHtmlAttributes(request);
+
+  // The only thing that changes from request to request (for now) are
+  // the HTML attributes (used by, eg, appcache) and whether inline
+  // scripts are allowed, so we can memoize based on that.
+  var memHash = JSON.stringify({
+    inlineScriptsAllowed: inlineScriptsAllowed,
+    htmlAttributes: htmlAttributes,
+    arch: arch
+  });
+
+  if (! memoizedBoilerplate[memHash]) {
+    memoizedBoilerplate[memHash] = boilerplateByArch[arch].toHTML({
+      htmlAttributes: htmlAttributes
+    });
+  }
+  return memoizedBoilerplate[memHash];
+};
+
+WebAppInternals.generateBoilerplateInstance = function (arch,
+                                                        manifest,
+                                                        additionalOptions) {
+  additionalOptions = additionalOptions || {};
+
+  var runtimeConfig = _.extend(
+    _.clone(__meteor_runtime_config__),
+    additionalOptions.runtimeConfigOverrides || {}
+  );
+
+  var jsCssPrefix;
+  if (arch === 'web.cordova') {
+    // in cordova we serve assets up directly from disk so it doesn't make
+    // sense to use the prefix (ordinarily something like a CDN) and go out
+    // to the internet for those files.
+    jsCssPrefix = '';
+  } else {
+    jsCssPrefix = bundledJsCssPrefix ||
+      __meteor_runtime_config__.ROOT_URL_PATH_PREFIX || '';
+  }
+
+  return new Boilerplate(arch, manifest,
+    _.extend({
+      pathMapper: function (itemPath) {
+        return path.join(archPath[arch], itemPath); },
+      baseDataExtension: {
+        additionalStaticJs: _.map(
+          additionalStaticJs || [],
+          function (contents, pathname) {
+            return {
+              pathname: pathname,
+              contents: contents
+            };
+          }
+        ),
+        // Convert to a JSON string, then get rid of most weird characters, then
+        // wrap in double quotes. (The outermost JSON.stringify really ought to
+        // just be "wrap in double quotes" but we use it to be safe.) This might
+        // end up inside a <script> tag so we need to be careful to not include
+        // "</script>", but normal {{spacebars}} escaping escapes too much! See
+        // https://github.com/meteor/meteor/issues/3730
+        meteorRuntimeConfig: JSON.stringify(
+          encodeURIComponent(JSON.stringify(runtimeConfig))),
+        rootUrlPathPrefix: __meteor_runtime_config__.ROOT_URL_PATH_PREFIX || '',
+        bundledJsCssPrefix: jsCssPrefix,
+        inlineScriptsAllowed: WebAppInternals.inlineScriptsAllowed(),
+        inline: additionalOptions.inline
+      }
+    }, additionalOptions)
+  );
+};
+
+// A mapping from url path to "info". Where "info" has the following fields:
+// - type: the type of file to be served
+// - cacheable: optionally, whether the file should be cached or not
+// - sourceMapUrl: optionally, the url of the source map
+//
+// Info also contains one of the following:
+// - content: the stringified content that should be served at this path
+// - absolutePath: the absolute path on disk to the file
+
+var staticFiles;
+
+// Serve static files from the manifest or added with
+// `addStaticJs`. Exported for tests.
+WebAppInternals.staticFilesMiddleware = function (staticFiles, req, res, next) {
+  if ('GET' != req.method && 'HEAD' != req.method) {
+    next();
+    return;
+  }
+  var pathname = connect.utils.parseUrl(req).pathname;
+  try {
+    pathname = decodeURIComponent(pathname);
+  } catch (e) {
+    next();
+    return;
+  }
+
+  var serveStaticJs = function (s) {
+    res.writeHead(200, {
+      'Content-type': 'application/javascript; charset=UTF-8'
+    });
+    res.write(s);
+    res.end();
+  };
+
+  if (pathname === "/meteor_runtime_config.js" &&
+      ! WebAppInternals.inlineScriptsAllowed()) {
+    serveStaticJs("__meteor_runtime_config__ = " +
+                  JSON.stringify(__meteor_runtime_config__) + ";");
+    return;
+  } else if (_.has(additionalStaticJs, pathname) &&
+              ! WebAppInternals.inlineScriptsAllowed()) {
+    serveStaticJs(additionalStaticJs[pathname]);
+    return;
+  }
+
+  if (!_.has(staticFiles, pathname)) {
+    next();
+    return;
+  }
+
+  // We don't need to call pause because, unlike 'static', once we call into
+  // 'send' and yield to the event loop, we never call another handler with
+  // 'next'.
+
+  var info = staticFiles[pathname];
+
+  // Cacheable files are files that should never change. Typically
+  // named by their hash (eg meteor bundled js and css files).
+  // We cache them ~forever (1yr).
+  //
+  // We cache non-cacheable files anyway. This isn't really correct, as users
+  // can change the files and changes won't propagate immediately. However, if
+  // we don't cache them, browsers will 'flicker' when rerendering
+  // images. Eventually we will probably want to rewrite URLs of static assets
+  // to include a query parameter to bust caches. That way we can both get
+  // good caching behavior and allow users to change assets without delay.
+  // https://github.com/meteor/meteor/issues/773
+  var maxAge = info.cacheable
+        ? 1000 * 60 * 60 * 24 * 365
+        : 1000 * 60 * 60 * 24;
+
+  // Set the X-SourceMap header, which current Chrome, FireFox, and Safari
+  // understand.  (The SourceMap header is slightly more spec-correct but FF
+  // doesn't understand it.)
+  //
+  // You may also need to enable source maps in Chrome: open dev tools, click
+  // the gear in the bottom right corner, and select "enable source maps".
+  if (info.sourceMapUrl) {
+    res.setHeader('X-SourceMap',
+                  __meteor_runtime_config__.ROOT_URL_PATH_PREFIX +
+                  info.sourceMapUrl);
+  }
+
+  if (info.type === "js") {
+    res.setHeader("Content-Type", "application/javascript; charset=UTF-8");
+  } else if (info.type === "css") {
+    res.setHeader("Content-Type", "text/css; charset=UTF-8");
+  } else if (info.type === "json") {
+    res.setHeader("Content-Type", "application/json; charset=UTF-8");
+    // XXX if it is a manifest we are serving, set additional headers
+    if (/\/manifest.json$/.test(pathname)) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+    }
+  }
+
+  if (info.content) {
+    res.write(info.content);
+    res.end();
+  } else {
+    send(req, info.absolutePath)
+      .maxage(maxAge)
+      .hidden(true)  // if we specified a dotfile in the manifest, serve it
+      .on('error', function (err) {
+        Log.error("Error serving static file " + err);
+        res.writeHead(500);
+        res.end();
+      })
+      .on('directory', function () {
+        Log.error("Unexpected directory " + info.absolutePath);
+        res.writeHead(500);
+        res.end();
+      })
+      .pipe(res);
+  }
+};
+
+var getUrlPrefixForArch = function (arch) {
+  // XXX we rely on the fact that arch names don't contain slashes
+  // in that case we would need to uri escape it
+
+  // We add '__' to the beginning of non-standard archs to "scope" the url
+  // to Meteor internals.
+  return arch === WebApp.defaultArch ?
+    '' : '/' + '__' + arch.replace(/^web\./, '');
+};
+
+var runWebAppServer = function () {
+  var shuttingDown = false;
+  var syncQueue = new Meteor._SynchronousQueue();
+
+  var getItemPathname = function (itemUrl) {
+    return decodeURIComponent(url.parse(itemUrl).pathname);
+  };
+
+  WebAppInternals.reloadClientPrograms = function () {
+    syncQueue.runTask(function() {
+      staticFiles = {};
+      var generateClientProgram = function (clientPath, arch) {
+        // read the control for the client we'll be serving up
+        var clientJsonPath = path.join(__meteor_bootstrap__.serverDir,
+                                   clientPath);
+        var clientDir = path.dirname(clientJsonPath);
+        var clientJson = JSON.parse(readUtf8FileSync(clientJsonPath));
+        if (clientJson.format !== "web-program-pre1")
+          throw new Error("Unsupported format for client assets: " +
+                          JSON.stringify(clientJson.format));
+
+        if (! clientJsonPath || ! clientDir || ! clientJson)
+          throw new Error("Client config file not parsed.");
+
+        var urlPrefix = getUrlPrefixForArch(arch);
+
+        var manifest = clientJson.manifest;
+        _.each(manifest, function (item) {
+          if (item.url && item.where === "client") {
+            staticFiles[urlPrefix + getItemPathname(item.url)] = {
+              absolutePath: path.join(clientDir, item.path),
+              cacheable: item.cacheable,
+              // Link from source to its map
+              sourceMapUrl: item.sourceMapUrl,
+              type: item.type
+            };
+
+            if (item.sourceMap) {
+              // Serve the source map too, under the specified URL. We assume all
+              // source maps are cacheable.
+              staticFiles[urlPrefix + getItemPathname(item.sourceMapUrl)] = {
+                absolutePath: path.join(clientDir, item.sourceMap),
+                cacheable: true
+              };
+            }
+          }
+        });
+
+        var program = {
+          manifest: manifest,
+          version: WebAppHashing.calculateClientHash(manifest, null, _.pick(
+            __meteor_runtime_config__, 'PUBLIC_SETTINGS')),
+          PUBLIC_SETTINGS: __meteor_runtime_config__.PUBLIC_SETTINGS
+        };
+
+        WebApp.clientPrograms[arch] = program;
+
+        // Serve the program as a string at /foo/<arch>/manifest.json
+        // XXX change manifest.json -> program.json
+        staticFiles[path.join(urlPrefix, 'manifest.json')] = {
+          content: JSON.stringify(program),
+          cacheable: true,
+          type: "json"
+        };
+      };
+
+      try {
+        var clientPaths = __meteor_bootstrap__.configJson.clientPaths;
+        _.each(clientPaths, function (clientPath, arch) {
+          archPath[arch] = path.dirname(clientPath);
+          generateClientProgram(clientPath, arch);
+        });
+
+        // Exported for tests.
+        WebAppInternals.staticFiles = staticFiles;
+      } catch (e) {
+        Log.error("Error reloading the client program: " + e.stack);
+        process.exit(1);
+      }
+    });
+  };
+
+  WebAppInternals.generateBoilerplate = function () {
+    // This boilerplate will be served to the mobile devices when used with
+    // Meteor/Cordova for the Hot-Code Push and since the file will be served by
+    // the device's server, it is important to set the DDP url to the actual
+    // Meteor server accepting DDP connections and not the device's file server.
+    var defaultOptionsForArch = {
+      'web.cordova': {
+        runtimeConfigOverrides: {
+          // XXX We use absoluteUrl() here so that we serve https://
+          // URLs to cordova clients if force-ssl is in use. If we were
+          // to use __meteor_runtime_config__.ROOT_URL instead of
+          // absoluteUrl(), then Cordova clients would immediately get a
+          // HCP setting their DDP_DEFAULT_CONNECTION_URL to
+          // http://example.meteor.com. This breaks the app, because
+          // force-ssl doesn't serve CORS headers on 302
+          // redirects. (Plus it's undesirable to have clients
+          // connecting to http://example.meteor.com when force-ssl is
+          // in use.)
+          DDP_DEFAULT_CONNECTION_URL: process.env.MOBILE_DDP_URL ||
+            Meteor.absoluteUrl(),
+          ROOT_URL: process.env.MOBILE_ROOT_URL ||
+            Meteor.absoluteUrl()
+        }
+      }
+    };
+
+    syncQueue.runTask(function() {
+      _.each(WebApp.clientPrograms, function (program, archName) {
+        boilerplateByArch[archName] =
+          WebAppInternals.generateBoilerplateInstance(
+            archName, program.manifest,
+            defaultOptionsForArch[archName]);
+      });
+
+      // Clear the memoized boilerplate cache.
+      memoizedBoilerplate = {};
+
+      // Configure CSS injection for the default arch
+      // XXX implement the CSS injection for all archs?
+      WebAppInternals.refreshableAssets = {
+        allCss: boilerplateByArch[WebApp.defaultArch].baseData.css
+      };
+    });
+  };
+
+  WebAppInternals.reloadClientPrograms();
 
   // webserver
   var app = connect();
+
+  // Auto-compress any json, javascript, or text.
+  app.use(connect.compress());
+
+  // Packages and apps can add handlers that run before any other Meteor
+  // handlers via WebApp.rawConnectHandlers.
+  var rawConnectHandlers = connect();
+  app.use(rawConnectHandlers);
+
+  // We're not a proxy; reject (without crashing) attempts to treat us like
+  // one. (See #1212.)
+  app.use(function(req, res, next) {
+    if (RoutePolicy.isValidUrl(req.url)) {
+      next();
+      return;
+    }
+    res.writeHead(400);
+    res.write("Not a proxy");
+    res.end();
+  });
 
   // Strip off the path prefix, if it exists.
   app.use(function (request, response, next) {
@@ -184,124 +613,17 @@ var runWebAppServer = function () {
       next();
     }
   });
+
   // Parse the query string into res.query. Used by oauth_server, but it's
   // generally pretty handy..
   app.use(connect.query());
 
-  // Auto-compress any json, javascript, or text.
-  app.use(connect.compress());
-
-  var getItemPathname = function (itemUrl) {
-    return decodeURIComponent(url.parse(itemUrl).pathname);
-  };
-
-  var staticFiles = {};
-  _.each(clientJson.manifest, function (item) {
-    if (item.url && item.where === "client") {
-      staticFiles[getItemPathname(item.url)] = {
-        path: item.path,
-        cacheable: item.cacheable,
-        // Link from source to its map
-        sourceMapUrl: item.sourceMapUrl
-      };
-
-      if (item.sourceMap) {
-        // Serve the source map too, under the specified URL. We assume all
-        // source maps are cacheable.
-        staticFiles[getItemPathname(item.sourceMapUrl)] = {
-          path: item.sourceMap,
-          cacheable: true
-        };
-      }
-    }
-  });
-
   // Serve static files from the manifest.
   // This is inspired by the 'static' middleware.
   app.use(function (req, res, next) {
-    if ('GET' != req.method && 'HEAD' != req.method) {
-      next();
-      return;
-    }
-    var pathname = connect.utils.parseUrl(req).pathname;
-
-    try {
-      pathname = decodeURIComponent(pathname);
-    } catch (e) {
-      next();
-      return;
-    }
-    if (!_.has(staticFiles, pathname)) {
-      next();
-      return;
-    }
-
-    // We don't need to call pause because, unlike 'static', once we call into
-    // 'send' and yield to the event loop, we never call another handler with
-    // 'next'.
-
-    var info = staticFiles[pathname];
-
-    // Cacheable files are files that should never change. Typically
-    // named by their hash (eg meteor bundled js and css files).
-    // We cache them ~forever (1yr).
-    //
-    // We cache non-cacheable files anyway. This isn't really correct, as users
-    // can change the files and changes won't propagate immediately. However, if
-    // we don't cache them, browsers will 'flicker' when rerendering
-    // images. Eventually we will probably want to rewrite URLs of static assets
-    // to include a query parameter to bust caches. That way we can both get
-    // good caching behavior and allow users to change assets without delay.
-    // https://github.com/meteor/meteor/issues/773
-    var maxAge = info.cacheable
-          ? 1000 * 60 * 60 * 24 * 365
-          : 1000 * 60 * 60 * 24;
-
-    // Set the X-SourceMap header, which current Chrome understands.
-    // (The files also contain '//#' comments which FF 24 understands and
-    // Chrome doesn't understand yet.)
-    //
-    // Eventually we should set the SourceMap header but the current version of
-    // Chrome and no version of FF supports it.
-    //
-    // To figure out if your version of Chrome should support the SourceMap
-    // header,
-    //   - go to chrome://version. Let's say the Chrome version is
-    //      28.0.1500.71 and the Blink version is 537.36 (@153022)
-    //   - go to http://src.chromium.org/viewvc/blink/branches/chromium/1500/Source/core/inspector/InspectorPageAgent.cpp?view=log
-    //     where the "1500" is the third part of your Chrome version
-    //   - find the first revision that is no greater than the "153022"
-    //     number.  That's probably the first one and it probably has
-    //     a message of the form "Branch 1500 - blink@r149738"
-    //   - If *that* revision number (149738) is at least 151755,
-    //     then Chrome should support SourceMap (not just X-SourceMap)
-    // (The change is https://codereview.chromium.org/15832007)
-    //
-    // You also need to enable source maps in Chrome: open dev tools, click
-    // the gear in the bottom right corner, and select "enable source maps".
-    //
-    // Firefox 23+ supports source maps but doesn't support either header yet,
-    // so we include the '//#' comment for it:
-    //   https://bugzilla.mozilla.org/show_bug.cgi?id=765993
-    // In FF 23 you need to turn on `devtools.debugger.source-maps-enabled`
-    // in `about:config` (it is on by default in FF 24).
-    if (info.sourceMapUrl)
-      res.setHeader('X-SourceMap', info.sourceMapUrl);
-
-    send(req, path.join(clientDir, info.path))
-      .maxage(maxAge)
-      .hidden(true)  // if we specified a dotfile in the manifest, serve it
-      .on('error', function (err) {
-        Log.error("Error serving static file " + err);
-        res.writeHead(500);
-        res.end();
-      })
-      .on('directory', function () {
-        Log.error("Unexpected directory " + info.path);
-        res.writeHead(500);
-        res.end();
-      })
-      .pipe(res);
+    Fiber(function () {
+     WebAppInternals.staticFilesMiddleware(staticFiles, req, res, next);
+    }).run();
   });
 
   // Packages and apps can add handlers to this via WebApp.connectHandlers.
@@ -322,21 +644,68 @@ var runWebAppServer = function () {
     res.end("An error message");
   });
 
-  // Will be updated by main before we listen.
-  var boilerplateHtml = null;
   app.use(function (req, res, next) {
     if (! appUrl(req.url))
       return next();
 
-    if (!boilerplateHtml)
-      throw new Error("boilerplateHtml should be set before listening!");
+    var headers = {
+      'Content-Type':  'text/html; charset=utf-8'
+    };
+    if (shuttingDown)
+      headers['Connection'] = 'Close';
 
     var request = WebApp.categorizeRequest(req);
 
-    res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
+    if (request.url.query && request.url.query['meteor_css_resource']) {
+      // In this case, we're requesting a CSS resource in the meteor-specific
+      // way, but we don't have it.  Serve a static css file that indicates that
+      // we didn't have it, so we can detect that and refresh.  Make sure
+      // that any proxies or CDNs don't cache this error!  (Normally proxies
+      // or CDNs are smart enough not to cache error pages, but in order to
+      // make this hack work, we need to return the CSS file as a 200, which
+      // would otherwise be cached.)
+      headers['Content-Type'] = 'text/css; charset=utf-8';
+      headers['Cache-Control'] = 'no-cache';
+      res.writeHead(200, headers);
+      res.write(".meteor-css-not-found-error { width: 0px;}");
+      res.end();
+      return undefined;
+    }
 
-    var requestSpecificHtml = htmlAttributes(boilerplateHtml, request);
-    res.write(requestSpecificHtml);
+    if (request.url.query && request.url.query['meteor_js_resource']) {
+      // Similarly, we're requesting a JS resource that we don't have.
+      // Serve an uncached 404. (We can't use the same hack we use for CSS,
+      // because actually acting on that hack requires us to have the JS
+      // already!)
+      headers['Cache-Control'] = 'no-cache';
+      res.writeHead(404, headers);
+      res.end("404 Not Found");
+      return undefined;
+    }
+
+    // /packages/asdfsad ... /__cordova/dafsdf.js
+    var pathname = connect.utils.parseUrl(req).pathname;
+    var archKey = pathname.split('/')[1];
+    var archKeyCleaned = 'web.' + archKey.replace(/^__/, '');
+
+    if (! /^__/.test(archKey) || ! _.has(archPath, archKeyCleaned)) {
+      archKey = WebApp.defaultArch;
+    } else {
+      archKey = archKeyCleaned;
+    }
+
+    var boilerplate;
+    try {
+      boilerplate = getBoilerplate(request, archKey);
+    } catch (e) {
+      Log.error("Error running template: " + e);
+      res.writeHead(500, headers);
+      res.end();
+      return undefined;
+    }
+
+    res.writeHead(200, headers);
+    res.write(boilerplate);
     res.end();
     return undefined;
   });
@@ -351,16 +720,22 @@ var runWebAppServer = function () {
   var httpServer = http.createServer(app);
   var onListeningCallbacks = [];
 
+  // After 5 seconds w/o data on a socket, kill it.  On the other hand, if
+  // there's an outstanding request, give it a higher timeout instead (to avoid
+  // killing long-polling requests)
+  httpServer.setTimeout(SHORT_SOCKET_TIMEOUT);
+
+  // Do this here, and then also in livedata/stream_server.js, because
+  // stream_server.js kills all the current request handlers when installing its
+  // own.
+  httpServer.on('request', WebApp._timeoutAdjustmentRequestCallback);
+
+
   // start up app
   _.extend(WebApp, {
     connectHandlers: packageAndAppHandlers,
+    rawConnectHandlers: rawConnectHandlers,
     httpServer: httpServer,
-    // metadata about the client program that we serve
-    clientProgram: {
-      manifest: clientJson.manifest
-      // XXX do we need a "root: clientDir" field here? it used to be here but
-      // was unused.
-    },
     // For testing.
     suppressConnectErrors: function () {
       suppressConnectErrors = true;
@@ -370,69 +745,22 @@ var runWebAppServer = function () {
         onListeningCallbacks.push(f);
       else
         f();
-    },
-    // Hack: allow http tests to call connect.basicAuth without making them
-    // Npm.depends on another copy of connect. (That would be fine if we could
-    // have test-only NPM dependencies but is overkill here.)
-    __basicAuth__: connect.basicAuth
+    }
   });
 
   // Let the rest of the packages (and Meteor.startup hooks) insert connect
   // middlewares and update __meteor_runtime_config__, then keep going to set up
   // actually serving HTML.
   main = function (argv) {
-    // main happens post startup hooks, so we don't need a Meteor.startup() to
-    // ensure this happens after the galaxy package is loaded.
-    var AppConfig = Package["application-configuration"].AppConfig;
-    argv = optimist(argv).boolean('keepalive').argv;
-
-    var boilerplateHtmlPath = path.join(clientDir, clientJson.page);
-    boilerplateHtml =
-      fs.readFileSync(boilerplateHtmlPath, 'utf8')
-      .replace(
-        "// ##RUNTIME_CONFIG##",
-        "__meteor_runtime_config__ = " +
-          JSON.stringify(__meteor_runtime_config__) + ";")
-      .replace(
-          /##ROOT_URL_PATH_PREFIX##/g,
-        __meteor_runtime_config__.ROOT_URL_PATH_PREFIX || "");
+    WebAppInternals.generateBoilerplate();
 
     // only start listening after all the startup code has run.
     var localPort = parseInt(process.env.PORT) || 0;
     var host = process.env.BIND_IP;
     var localIp = host || '0.0.0.0';
     httpServer.listen(localPort, localIp, Meteor.bindEnvironment(function() {
-      if (argv.keepalive || true)
-        console.log("LISTENING"); // must match run.js
-      var port = httpServer.address().port;
-      var proxyBinding;
-
-      AppConfig.configurePackage('webapp', function (configuration) {
-        if (proxyBinding)
-          proxyBinding.stop();
-        if (configuration && configuration.proxy) {
-          proxyBinding = AppConfig.configureService(configuration.proxyServiceName || "proxy", function (proxyService) {
-            if (proxyService.providers.proxy) {
-              var proxyConf;
-              if (process.env.ADMIN_APP) {
-                proxyConf = {
-                  securePort: 44333,
-                  insecurePort: 9414,
-                  bindHost: "localhost",
-                  bindPathPrefix: "/" + process.env.GALAXY_APP
-                };
-              } else {
-                proxyConf = configuration.proxy;
-
-              }
-              Log("Attempting to bind to proxy at " + proxyService.providers.proxy);
-              WebAppInternals.bindToProxy(_.extend({
-                proxyEndpoint: proxyService.providers.proxy
-              }, proxyConf));
-            }
-          });
-        }
-      });
+      if (process.env.METEOR_PRINT_ON_LISTEN)
+        console.log("LISTENING"); // must match run-app.js
 
       var callbacks = onListeningCallbacks;
       onListeningCallbacks = null;
@@ -440,111 +768,42 @@ var runWebAppServer = function () {
 
     }, function (e) {
       console.error("Error listening:", e);
-      console.error(e.stack);
+      console.error(e && e.stack);
     }));
 
-    if (argv.keepalive)
-      initKeepalive();
     return 'DAEMON';
   };
 };
 
-WebAppInternals.bindToProxy = function (proxyConfig) {
-  var securePort = proxyConfig.securePort || 4433;
-  var insecurePort = proxyConfig.insecurePort || 8080;
-  var bindPathPrefix = proxyConfig.bindPathPrefix || "";
-  // XXX also support galaxy-based lookup
-  if (!proxyConfig.proxyEndpoint)
-    throw new Error("missing proxyEndpoint");
-  if (!proxyConfig.bindHost)
-    throw new Error("missing bindHost");
-  if (!process.env.GALAXY_JOB)
-    throw new Error("missing $GALAXY_JOB");
-  if (!process.env.GALAXY_APP)
-    throw new Error("missing $GALAXY_APP");
-  if (!process.env.LAST_START)
-    throw new Error("missing $LAST_START");
-
-  // XXX rename pid argument to bindTo.
-  var pid = {
-    job: process.env.GALAXY_JOB,
-    lastStarted: process.env.LAST_START,
-    app: process.env.GALAXY_APP
-  };
-  var myHost = os.hostname();
-
-  var ddpBindTo = {
-    ddpUrl: 'ddp://' + proxyConfig.bindHost + ':' + securePort + bindPathPrefix + '/',
-    insecurePort: insecurePort
-  };
-
-  // This is run after packages are loaded (in main) so we can use
-  // DDP.connect.
-  var proxy = DDP.connect(proxyConfig.proxyEndpoint);
-  var route = process.env.ROUTE;
-  var host = route.split(":")[0];
-  var port = +route.split(":")[1];
-
-  var completedBindings = {
-    ddp: false,
-    http: false,
-    https: proxyConfig.securePort !== null ? false : undefined
-  };
-
-  var bindingDoneCallback = function (binding) {
-    return function (err, resp) {
-      if (err)
-        throw err;
-
-      completedBindings[binding] = true;
-      var completedAll = _.every(_.keys(completedBindings), function (binding) {
-        return (completedBindings[binding] ||
-          completedBindings[binding] === undefined);
-      });
-      if (completedAll)
-        Log("Bound to proxy.");
-      return completedAll;
-    };
-  };
-
-  proxy.call('bindDdp', {
-    pid: pid,
-    bindTo: ddpBindTo,
-    proxyTo: {
-      host: host,
-      port: port,
-      pathPrefix: bindPathPrefix + '/websocket'
-    }
-  }, bindingDoneCallback("ddp"));
-  proxy.call('bindHttp', {
-    pid: pid,
-    bindTo: {
-      host: proxyConfig.bindHost,
-      port: insecurePort,
-      pathPrefix: bindPathPrefix
-    },
-    proxyTo: {
-      host: host,
-      port: port,
-      pathPrefix: bindPathPrefix
-    }
-  }, bindingDoneCallback("http"));
-  if (proxyConfig.securePort !== null) {
-    proxy.call('bindHttp', {
-      pid: pid,
-      bindTo: {
-        host: proxyConfig.bindHost,
-        port: securePort,
-        pathPrefix: bindPathPrefix,
-        ssl: true
-      },
-      proxyTo: {
-        host: host,
-        port: port,
-        pathPrefix: bindPathPrefix
-      }
-    }, bindingDoneCallback("https"));
-  }
-};
 
 runWebAppServer();
+
+
+var inlineScriptsAllowed = true;
+
+WebAppInternals.inlineScriptsAllowed = function () {
+  return inlineScriptsAllowed;
+};
+
+WebAppInternals.setInlineScriptsAllowed = function (value) {
+  inlineScriptsAllowed = value;
+  WebAppInternals.generateBoilerplate();
+};
+
+WebAppInternals.setBundledJsCssPrefix = function (prefix) {
+  bundledJsCssPrefix = prefix;
+  WebAppInternals.generateBoilerplate();
+};
+
+// Packages can call `WebAppInternals.addStaticJs` to specify static
+// JavaScript to be included in the app. This static JS will be inlined,
+// unless inline scripts have been disabled, in which case it will be
+// served under `/<sha1 of contents>`.
+var additionalStaticJs = {};
+WebAppInternals.addStaticJs = function (contents) {
+  additionalStaticJs["/" + sha1(contents) + ".js"] = contents;
+};
+
+// Exported for tests
+WebAppInternals.getBoilerplate = getBoilerplate;
+WebAppInternals.additionalStaticJs = additionalStaticJs;

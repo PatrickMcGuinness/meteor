@@ -1,8 +1,10 @@
 Package.describe({
-  summary: "Execute a function when the user scrolls past an element"
+  summary: "Run a function when the user scrolls past an element",
+  version: "1.0.4"
 });
 
-Package.on_use(function (api) {
+Package.onUse(function (api) {
   api.use('jquery');
-  api.add_files('waypoints.js', 'client');
+  api.use('coffeescript');
+  api.addFiles('waypoints.coffee', 'client');
 });

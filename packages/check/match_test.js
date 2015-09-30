@@ -101,6 +101,27 @@ Tinytest.add("check - check", function (test) {
   // Match.Optional means "or undefined" at the top level but "or absent" in
   // objects.
   fails({a: undefined}, {a: Match.Optional(Number)});
+  var F = function () {
+    this.x = 123;
+  };
+  fails(new F, { x: 123 });
+
+  matches({}, Match.ObjectWithValues(Number));
+  matches({x: 1}, Match.ObjectWithValues(Number));
+  matches({x: 1, y: 2}, Match.ObjectWithValues(Number));
+  fails({x: 1, y: "2"}, Match.ObjectWithValues(Number));
+
+  matches("asdf", "asdf");
+  fails("asdf", "monkey");
+  matches(123, 123);
+  fails(123, 456);
+  fails("123", 123);
+  fails(123, "123");
+  matches(true, true);
+  matches(false, false);
+  fails(true, false);
+  fails(true, "true");
+  fails("false", false);
 
   matches(/foo/, RegExp);
   fails(/foo/, String);
@@ -177,6 +198,10 @@ Tinytest.add("check - argument checker", function (test) {
     check(x, Number);
     check(_.toArray(arguments).slice(1), [String]);
   }, 1, "foo", "bar", "baz");
+  // NaN values
+  checksAllArguments(function (x) {
+    check(x, Number);
+  }, NaN);
 
   var doesntCheckAllArguments = function (f /*arguments*/) {
     try {
@@ -257,3 +282,30 @@ Tinytest.add("check - Match error path", function (test) {
   match({ "return": 0 }, { "return": String }, "[\"return\"]");
 });
 
+// Regression test for https://github.com/meteor/meteor/issues/2136
+Meteor.isServer && Tinytest.addAsync("check - non-fiber check works", function (test, onComplete) {
+  var Fiber = Npm.require('fibers');
+
+  // We can only call test.isTrue inside normal Meteor Fibery code, so give us a
+  // bindEnvironment way to get back.
+  var report = Meteor.bindEnvironment(function (success) {
+    test.isTrue(success);
+    onComplete();
+  });
+
+  // Get out of a fiber with process.nextTick and ensure that we can still use
+  // check.
+  process.nextTick(function () {
+    var success = true;
+    if (Fiber.current)
+      success = false;
+    if (success) {
+      try {
+        check(true, Boolean);
+      } catch (e) {
+        success = false;
+      }
+    }
+    report(success);
+  });
+});

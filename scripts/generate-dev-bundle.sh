@@ -3,92 +3,67 @@
 set -e
 set -u
 
-UNAME=$(uname)
-ARCH=$(uname -m)
-
-if [ "$UNAME" == "Linux" ] ; then
-    if [ "$ARCH" != "i686" -a "$ARCH" != "x86_64" ] ; then
-        echo "Unsupported architecture: $ARCH"
-        echo "Meteor only supports i686 and x86_64 for now."
-        exit 1
-    fi
-
-    MONGO_OS="linux"
-
-    stripBinary() {
-        strip --remove-section=.comment --remove-section=.note $1
-    }
-elif [ "$UNAME" == "Darwin" ] ; then
-    SYSCTL_64BIT=$(sysctl -n hw.cpu64bit_capable 2>/dev/null || echo 0)
-    if [ "$ARCH" == "i386" -a "1" != "$SYSCTL_64BIT" ] ; then
-        # some older macos returns i386 but can run 64 bit binaries.
-        # Probably should distribute binaries built on these machines,
-        # but it should be OK for users to run.
-        ARCH="x86_64"
-    fi
-
-    if [ "$ARCH" != "x86_64" ] ; then
-        echo "Unsupported architecture: $ARCH"
-        echo "Meteor only supports x86_64 for now."
-        exit 1
-    fi
-
-    MONGO_OS="osx"
-
-    # We don't strip on Mac because we don't know a safe command. (Can't strip
-    # too much because we do need node to be able to load objects like
-    # fibers.node.)
-    stripBinary() {
-        true
-    }
-else
-    echo "This OS not yet supported"
-    exit 1
-fi
-
-PLATFORM="${UNAME}_${ARCH}"
-
-# save off meteor checkout dir as final target
-cd `dirname $0`/..
-TARGET_DIR=`pwd`
-
 # Read the bundle version from the meteor shell script.
 BUNDLE_VERSION=$(perl -ne 'print $1 if /BUNDLE_VERSION=(\S+)/' meteor)
 if [ -z "$BUNDLE_VERSION" ]; then
     echo "BUNDLE_VERSION not found"
     exit 1
 fi
-echo "Building dev bundle $BUNDLE_VERSION"
 
-DIR=`mktemp -d -t generate-dev-bundle-XXXXXXXX`
-trap 'rm -rf "$DIR" >/dev/null 2>&1' 0
-
-echo BUILDING IN "$DIR"
+source "$(dirname $0)/build-dev-bundle-common.sh"
+echo CHECKOUT DIR IS "$CHECKOUT_DIR"
+echo BUILDING DEV BUNDLE "$BUNDLE_VERSION" IN "$DIR"
 
 cd "$DIR"
-chmod 755 .
-umask 022
-mkdir build
-cd build
 
-git clone git://github.com/joyent/node.git
-cd node
-# When upgrading node versions, also update the values of MIN_NODE_VERSION at
-# the top of tools/meteor.js and tools/server/server.js, and the text in
-# docs/client/concepts.html and the README in tools/bundler.js.
-git checkout v0.8.24
+S3_HOST="s3.amazonaws.com/com.meteor.jenkins"
 
-./configure --prefix="$DIR"
-make -j4
-make install PORTABLE=1
-# PORTABLE=1 is a node hack to make npm look relative to itself instead
-# of hard coding the PREFIX.
+# Update these values after building the dev-bundle-node Jenkins project.
+# Also make sure to update NODE_VERSION in generate-dev-bundle.ps1.
+NODE_VERSION=0.10.40
+NODE_BUILD_NUMBER=18
+NODE_TGZ="node_${PLATFORM}_v${NODE_VERSION}.tar.gz"
+if [ -f "${CHECKOUT_DIR}/${NODE_TGZ}" ] ; then
+    tar zxf "${CHECKOUT_DIR}/${NODE_TGZ}"
+else
+    NODE_URL="https://${S3_HOST}/dev-bundle-node-${NODE_BUILD_NUMBER}/${NODE_TGZ}"
+    echo "Downloading Node from ${NODE_URL}"
+    curl "${NODE_URL}" | tar zx
+fi
 
-# export path so we use our new node for later builds
+# Update these values after building the dev-bundle-mongo Jenkins project.
+# Also make sure to update MONGO_VERSION in generate-dev-bundle.ps1.
+MONGO_VERSION=2.6.7
+MONGO_BUILD_NUMBER=6
+MONGO_TGZ="mongo_${PLATFORM}_v${MONGO_VERSION}.tar.gz"
+if [ -f "${CHECKOUT_DIR}/${MONGO_TGZ}" ] ; then
+    tar zxf "${CHECKOUT_DIR}/${MONGO_TGZ}"
+else
+    MONGO_URL="https://${S3_HOST}/dev-bundle-mongo-${MONGO_BUILD_NUMBER}/${MONGO_TGZ}"
+    echo "Downloading Mongo from ${MONGO_URL}"
+    curl "${MONGO_URL}" | tar zx
+fi
+
+# Copy bundled npm to temporary directory so we can restore it later
+# We do this because the bundled node is built using PORTABLE=1,
+# which makes npm look for node relative to it's own directory
+# See build-node-for-dev-bundle.sh
+cp -R "$DIR/lib/node_modules/npm" "$DIR/bundled-npm"
+
+# export path so we use the downloaded node and npm
 export PATH="$DIR/bin:$PATH"
 
-which node
+# install npm 3 in a temporary directory
+mkdir "$DIR/bin/npm3"
+cd "$DIR/bin/npm3"
+npm install npm@3.1.2
+cp node_modules/npm/bin/npm .
 
+# export path again with our temporary npm3 directory first,
+# so we can use npm 3 during builds
+export PATH="$DIR/bin/npm3:$PATH"
+
+which node
 which npm
 
 # When adding new node modules (or any software) to the dev bundle,
@@ -96,112 +71,100 @@ which npm
 # packages that these depend on, so watch out for new dependencies when
 # you update version numbers.
 
-cd "$DIR/lib/node_modules"
-npm install optimist@0.3.5
-npm install semver@1.1.0
-npm install handlebars@1.0.7
-npm install request@2.12.0
-npm install keypress@0.1.0
-npm install http-proxy@0.10.1  # not 0.10.2, which contains a sketchy websocket change
-npm install underscore@1.5.1
-npm install fstream@0.1.21
-npm install tar@0.1.14
-npm install kexec@0.1.1
-npm install shell-quote@0.0.1   # now at 1.3.3, which adds plenty of options to parse but doesn't change quote
-npm install byline@2.0.3  # v3 requires node 0.10
-npm install source-map@0.1.26
+# First, we install the modules that are dependencies of tools/server/boot.js:
+# the modules that users of 'meteor bundle' will also have to install. We save a
+# shrinkwrap file with it, too.  We do this in a separate place from
+# $DIR/server-lib/node_modules originally, because otherwise 'npm shrinkwrap'
+# will get confused by the pre-existing modules.
+mkdir "${DIR}/build/npm-server-install"
+cd "${DIR}/build/npm-server-install"
+node "${CHECKOUT_DIR}/scripts/dev-bundle-server-package.js" >package.json
+npm install
+npm shrinkwrap
 
-# Using the unreleased 1.1 branch. We can probably switch to a built NPM version
-# when it gets released.
-npm install https://github.com/ariya/esprima/tarball/5044b87f94fb802d9609f1426c838874ec2007b3
+mkdir -p "${DIR}/server-lib/node_modules"
+# This ignores the stuff in node_modules/.bin, but that's OK.
+cp -R node_modules/* "${DIR}/server-lib/node_modules/"
 
-# Fork of node-source-map-support which allows us to specify our own
-# retrieveSourceMap function, and uses source-map 0.1.26.
-#   https://github.com/evanw/node-source-map-support/pull/18
-#   https://github.com/evanw/node-source-map-support/pull/17
-npm install https://github.com/meteor/node-source-map-support/tarball/980e444c8346bbe29992fd3086bab0456b8d8667
+mv package.json npm-shrinkwrap.json "${DIR}/etc/"
 
-# If you update the version of fibers in the dev bundle, also update the "npm
-# install" command in docs/client/concepts.html and in the README in
-# tools/bundler.js.
-npm install fibers@1.0.1
 # Fibers ships with compiled versions of its C code for a dozen platforms. This
-# bloats our dev bundle, and confuses dpkg-buildpackage and rpmbuild into
-# thinking that the packages need to depend on both 32- and 64-bit versions of
-# libstd++. Remove all the ones other than our architecture. (Expression based
-# on build.js in fibers source.)
-FIBERS_ARCH=$(node -p -e 'process.platform + "-" + process.arch + "-v8-" + /[0-9]+\.[0-9]+/.exec(process.versions.v8)[0]')
-cd fibers/bin
-mv $FIBERS_ARCH ..
-rm -rf *
-mv ../$FIBERS_ARCH .
-cd ../..
+# bloats our dev bundle. Remove all the ones other than our
+# architecture. (Expression based on build.js in fibers source.)
+shrink_fibers () {
+    FIBERS_ARCH=$(node -p -e 'process.platform + "-" + process.arch + "-v8-" + /[0-9]+\.[0-9]+/.exec(process.versions.v8)[0]')
+    mv $FIBERS_ARCH ..
+    rm -rf *
+    mv ../$FIBERS_ARCH .
+}
 
-# Checkout and build mongodb.
-# We want to build a binary that includes SSL support but does not depend on a
-# particular version of openssl on the host system.
+cd "$DIR/server-lib/node_modules/fibers/bin"
+shrink_fibers
 
-cd "$DIR/build"
-OPENSSL="openssl-1.0.1e"
-OPENSSL_URL="http://www.openssl.org/source/$OPENSSL.tar.gz"
-wget $OPENSSL_URL || curl -O $OPENSSL_URL
-tar xzf $OPENSSL.tar.gz
+# Now, install the npm modules which are the dependencies of the command-line
+# tool.
+mkdir "${DIR}/build/npm-tool-install"
+cd "${DIR}/build/npm-tool-install"
+node "${CHECKOUT_DIR}/scripts/dev-bundle-tool-package.js" >package.json
+npm install
+cp -R node_modules/* "${DIR}/lib/node_modules/"
 
-cd $OPENSSL
-if [ "$UNAME" == "Linux" ]; then
-    ./config --prefix="$DIR/build/openssl-out" no-shared
-else
-    # This configuration line is taken from Homebrew formula:
-    # https://github.com/mxcl/homebrew/blob/master/Library/Formula/openssl.rb
-    ./Configure no-shared zlib-dynamic --prefix="$DIR/build/openssl-out" darwin64-x86_64-cc enable-ec_nistp_64_gcc_128
-fi
-make install
+cd "${DIR}/lib"
 
-# To see the mongo changelog, go to http://www.mongodb.org/downloads,
-# click 'changelog' under the current version, then 'release notes' in
-# the upper right.
-cd "$DIR/build"
-MONGO_VERSION="2.4.4"
+# Clean up some bulky stuff.
+cd node_modules
 
-# We use Meteor fork since we added some changes to the building script.
-# Our patches allow us to link most of the libraries statically.
-git clone git://github.com/meteor/mongo.git
-cd mongo
-git checkout ssl-r$MONGO_VERSION
-
-# Compile
-
-MONGO_FLAGS="--ssl --release "
-MONGO_FLAGS+="--cpppath $DIR/build/openssl-out/include --libpath $DIR/build/openssl-out/lib "
-
-if [ "$MONGO_OS" == "osx" ]; then
-    # NOTE: '--64' option breaks the compilation, even it is on by default on x64 mac: https://jira.mongodb.org/browse/SERVER-5575
-    MONGO_FLAGS+="-j4 "
-    MONGO_FLAGS+="--openssl $DIR/build/openssl-out/lib "
-    /usr/local/bin/scons $MONGO_FLAGS mongo mongod
-elif [ "$MONGO_OS" == "linux" ]; then
-    MONGO_FLAGS+="-j2 --no-glibc-check --prefix=./ "
-    if [ "$ARCH" == "x86_64" ]; then
-      MONGO_FLAGS+="--64"
+# Used to delete bulky subtrees. It's an error (unlike with rm -rf) if they
+# don't exist, because that might mean it moved somewhere else and we should
+# update the delete line.
+delete () {
+    if [ ! -e "$1" ]; then
+        echo "Missing (moved?): $1"
+        exit 1
     fi
-    scons $MONGO_FLAGS mongo mongod
-else
-    echo "We don't know how to compile mongo for this platform"
-    exit 1
+    rm -rf "$1"
+}
+
+delete browserstack-webdriver/docs
+delete browserstack-webdriver/lib/test
+
+delete sqlite3/deps
+delete wordwrap/test
+delete moment/min
+
+# Remove esprima tests to reduce the size of the dev bundle
+find . -path '*/esprima-fb/test' | xargs rm -rf
+
+cd "$DIR/lib/node_modules/fibers/bin"
+shrink_fibers
+
+# Download BrowserStackLocal binary.
+BROWSER_STACK_LOCAL_URL="https://browserstack-binaries.s3.amazonaws.com/BrowserStackLocal-07-03-14-$OS-$ARCH.gz"
+
+cd "$DIR/build"
+curl -O $BROWSER_STACK_LOCAL_URL
+gunzip BrowserStackLocal*
+mv BrowserStackLocal* BrowserStackLocal
+mv BrowserStackLocal "$DIR/bin/"
+
+# remove our temporary npm3 directory
+rm -rf "$DIR/bin/npm3"
+
+# Sanity check to see if we're not breaking anything by replacing npm
+INSTALLED_NPM_VERSION=$(cat "$DIR/lib/node_modules/npm/package.json" |
+xargs -0 node -e "console.log(JSON.parse(process.argv[1]).version)")
+if [ "$INSTALLED_NPM_VERSION" != "1.4.28" ]; then
+  echo "Unexpected NPM version in lib/node_modules: $INSTALLED_NPM_VERSION"
+  echo "We will be replacing it with our own version because the bundled node"
+  echo "is built using PORTABLE=1, which makes npm look for node relative to"
+  echo "its own directory."
+  echo "Update this check if you know what you're doing."
+  exit 1
 fi
 
-# Copy binaries
-mkdir -p "$DIR/mongodb/bin"
-cp mongo "$DIR/mongodb/bin/"
-cp mongod "$DIR/mongodb/bin/"
-
-# Copy mongodb distribution information
-find ./distsrc -maxdepth 1 -type f -exec cp '{}' ../mongodb \;
-
-cd "$DIR"
-stripBinary bin/node
-stripBinary mongodb/bin/mongo
-stripBinary mongodb/bin/mongod
+# Overwrite lib/modules/npm with bundled npm from temporary directory
+rm -rf "$DIR/lib/node_modules/npm"
+mv -f "$DIR/bundled-npm" "$DIR/lib/node_modules/npm"
 
 echo BUNDLING
 
@@ -209,6 +172,6 @@ cd "$DIR"
 echo "${BUNDLE_VERSION}" > .bundle_version.txt
 rm -rf build
 
-tar czf "${TARGET_DIR}/dev_bundle_${PLATFORM}_${BUNDLE_VERSION}.tar.gz" .
+tar czf "${CHECKOUT_DIR}/dev_bundle_${PLATFORM}_${BUNDLE_VERSION}.tar.gz" .
 
 echo DONE

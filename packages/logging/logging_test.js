@@ -4,11 +4,21 @@ Tinytest.add("logging - _getCallerDetails", function (test) {
   // in Chrome and Firefox, other browsers don't give us an ability to get
   // stacktrace.
   if ((new Error).stack) {
-    test.equal(details.file, 'tinytest.js');
+    if (Meteor.isServer) {
+      test.equal(details.file, 'tinytest.js');
+    } else {
+      // Note that we want this to work in --production too, so we need to allow
+      // for the minified filename.
+      test.matches(details.file,
+                   /^(?:tinytest\.js|[a-f0-9]{40}\.js)$/);
+    }
 
     // evaled statements shouldn't crash
     var code = "Log._getCallerDetails().file";
-    test.matches(eval(code), /^eval|tinytest.js$/);
+    // Note that we want this to work in --production too, so we need to allow
+    // for the minified filename
+    test.matches(eval(code),
+                 /^(?:eval|local-test_logging\.js|[a-f0-9]{40}\.js)/);
   }
 });
 
@@ -92,7 +102,8 @@ Tinytest.add("logging - log", function (test) {
     test.throws(function () {
       log({level: 'not the right level'});
     });
-    _.each(['file', 'line', 'program', 'originApp'], function (restrictedKey) {
+    _.each(['file', 'line', 'program', 'originApp', 'satellite'],
+      function (restrictedKey) {
       test.throws(function () {
         var obj = {};
         obj[restrictedKey] = 'usage of restricted key';
@@ -180,4 +191,3 @@ Tinytest.add("logging - format", function (test) {
       level.charAt(0).toUpperCase() + '20120908-07:06:05.004' + utcOffsetStr + ' (app.js:42) message');
   });
 });
-

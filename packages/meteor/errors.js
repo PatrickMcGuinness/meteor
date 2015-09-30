@@ -1,11 +1,3 @@
-// http://davidshariff.com/blog/javascript-inheritance-patterns/
-var inherits = function (child, parent) {
-  var tmp = function () {};
-  tmp.prototype = parent.prototype;
-  child.prototype = new tmp;
-  child.prototype.constructor = child;
-};
-
 // Makes an error subclass which properly contains a stack trace in most
 // environments. constructor can set fields on `this` (and should probably set
 // `message`, which is what gets displayed at the top of a stack trace).
@@ -34,7 +26,7 @@ Meteor.makeErrorType = function (name, constructor) {
     return self;
   };
 
-  inherits(errorClass, Error);
+  Meteor._inherits(errorClass, Error);
 
   return errorClass;
 };
@@ -49,14 +41,46 @@ Meteor.makeErrorType = function (name, constructor) {
 // The DDP client manually puts these into Meteor.Error objects. (We don't use
 // EJSON.addType here because the type is determined by location in the
 // protocol, not text on the wire.)
-//
+
+/**
+ * @summary This class represents a symbolic error thrown by a method.
+ * @locus Anywhere
+ * @class
+ * @param {String} error A string code uniquely identifying this kind of error.
+ * This string should be used by callers of the method to determine the
+ * appropriate action to take, instead of attempting to parse the reason
+ * or details fields. For example:
+ *
+ * ```
+ * // on the server, pick a code unique to this error
+ * // the reason field should be a useful debug message
+ * throw new Meteor.Error("logged-out", 
+ *   "The user must be logged in to post a comment.");
+ *
+ * // on the client
+ * Meteor.call("methodName", function (error) {
+ *   // identify the error
+ *   if (error && error.error === "logged-out") {
+ *     // show a nice error message
+ *     Session.set("errorMessage", "Please log in to post a comment.");
+ *   }
+ * });
+ * ```
+ * 
+ * For legacy reasons, some built-in Meteor functions such as `check` throw
+ * errors with a number in this field.
+ * 
+ * @param {String} [reason] Optional.  A short human-readable summary of the
+ * error, like 'Not Found'.
+ * @param {String} [details] Optional.  Additional information about the error,
+ * like a textual stack trace.
+ */
 Meteor.Error = Meteor.makeErrorType(
   "Meteor.Error",
   function (error, reason, details) {
     var self = this;
 
-    // Currently, a numeric code, likely similar to a HTTP code (eg,
-    // 404, 500). That is likely to change though.
+    // String code uniquely identifying this kind of error.
     self.error = error;
 
     // Optional: A short human-readable summary of the error. Not
@@ -79,3 +103,13 @@ Meteor.Error = Meteor.makeErrorType(
     else
       self.message = '[' + self.error + ']';
   });
+
+// Meteor.Error is basically data and is sent over DDP, so you should be able to
+// properly EJSON-clone it. This is especially important because if a
+// Meteor.Error is thrown through a Future, the error, reason, and details
+// properties become non-enumerable so a standard Object clone won't preserve
+// them and they will be lost from DDP.
+Meteor.Error.prototype.clone = function () {
+  var self = this;
+  return new Meteor.Error(self.error, self.reason, self.details);
+};

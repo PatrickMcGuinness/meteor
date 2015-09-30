@@ -3,21 +3,18 @@ var Fiber = Npm.require('fibers');
 var Future = Npm.require(path.join('fibers', 'future'));
 
 Meteor._noYieldsAllowed = function (f) {
-  // "Fiber" and "yield" are both in the global namespace. The yield function is
-  // at both "yield" and "Fiber.yield". (It's also at require('fibers').yield
-  // but that is because require('fibers') === Fiber.)
   var savedYield = Fiber.yield;
   Fiber.yield = function () {
     throw new Error("Can't call yield in a noYieldsAllowed block!");
   };
-  global.yield = Fiber.yield;
   try {
     return f();
   } finally {
     Fiber.yield = savedYield;
-    global.yield = savedYield;
   }
 };
+
+Meteor._DoubleEndedQueue = Npm.require('meteor-deque');
 
 // Meteor._SynchronousQueue is a queue which runs task functions serially.
 // Tasks are assumed to be synchronous: ie, it's assumed that they are
@@ -42,7 +39,7 @@ Meteor._SynchronousQueue = function () {
   // is an object with field 'task' (the task function to run) and 'future' (the
   // Future associated with the blocking runTask call that queued it, or null if
   // called from queueTask).
-  self._taskHandles = [];
+  self._taskHandles = new Meteor._DoubleEndedQueue();
   // This is true if self._run() is either currently executing or scheduled to
   // do so soon.
   self._runningOrRunScheduled = false;
@@ -69,10 +66,15 @@ _.extend(Meteor._SynchronousQueue.prototype, {
     }
 
     var fut = new Future;
-    self._taskHandles.push({task: Meteor.bindEnvironment(task, function (e) {
-      Meteor._debug("Exception from task:", e ? e.stack : e);
-      throw e;
-    }), future: fut});
+    var handle = {
+      task: Meteor.bindEnvironment(task, function (e) {
+        Meteor._debug("Exception from task:", e && e.stack || e);
+        throw e;
+      }),
+      future: fut,
+      name: task.name
+    };
+    self._taskHandles.push(handle);
     self._scheduleRun();
     // Yield. We'll get back here after the task is run (and will throw if the
     // task throws).
@@ -80,7 +82,10 @@ _.extend(Meteor._SynchronousQueue.prototype, {
   },
   queueTask: function (task) {
     var self = this;
-    self._taskHandles.push({task: task});
+    self._taskHandles.push({
+      task: task,
+      name: task.name
+    });
     self._scheduleRun();
     // No need to block.
   },
@@ -102,7 +107,7 @@ _.extend(Meteor._SynchronousQueue.prototype, {
     if (!self.safeToRunTask())
       return;
     self._draining = true;
-    while (!_.isEmpty(self._taskHandles)) {
+    while (! self._taskHandles.isEmpty()) {
       self.flush();
     }
     self._draining = false;
@@ -110,14 +115,12 @@ _.extend(Meteor._SynchronousQueue.prototype, {
 
   _scheduleRun: function () {
     var self = this;
-
     // Already running or scheduled? Do nothing.
     if (self._runningOrRunScheduled)
       return;
 
     self._runningOrRunScheduled = true;
-
-    process.nextTick(function () {
+    setImmediate(function () {
       Fiber(function () {
         self._run();
       }).run();
@@ -129,7 +132,7 @@ _.extend(Meteor._SynchronousQueue.prototype, {
     if (!self._runningOrRunScheduled)
       throw new Error("expected to be _runningOrRunScheduled");
 
-    if (_.isEmpty(self._taskHandles)) {
+    if (self._taskHandles.isEmpty()) {
       // Done running tasks! Don't immediately schedule another run, but
       // allow future tasks to do so.
       self._runningOrRunScheduled = false;
@@ -147,7 +150,7 @@ _.extend(Meteor._SynchronousQueue.prototype, {
         // We'll throw this exception through runTask.
         exception = err;
       } else {
-        Meteor._debug("Exception in queued task: " + err.stack);
+        Meteor._debug("Exception in queued task: " + (err.stack || err));
       }
     }
     self._currentTaskFiber = undefined;

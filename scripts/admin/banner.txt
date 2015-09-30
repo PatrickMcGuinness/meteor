@@ -1,4 +1,0 @@
-=> Meteor 0.6.5: namespacing, modularity, new build system, source maps!
-
-   This is being downloaded in the background. Update your project
-   to Meteor 0.6.5 by running 'meteor update'.

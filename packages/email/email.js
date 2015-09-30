@@ -1,9 +1,19 @@
 var Future = Npm.require('fibers/future');
 var urlModule = Npm.require('url');
-var MailComposer = Npm.require('mailcomposer').MailComposer;
 
 Email = {};
 EmailTest = {};
+
+EmailInternals = {
+  NpmModules: {
+    mailcomposer: {
+      version: Npm.require('mailcomposer/package.json').version,
+      module: Npm.require('mailcomposer')
+    }
+  }
+};
+
+var MailComposer = EmailInternals.NpmModules.mailcomposer.module.MailComposer;
 
 var makePool = function (mailUrlString) {
   var mailUrl = urlModule.parse(mailUrlString);
@@ -31,22 +41,14 @@ var makePool = function (mailUrlString) {
   return pool;
 };
 
-// We construct smtpPool at the first call to Email.send, so that
-// Meteor.startup code can set $MAIL_URL.
-var smtpPool = null;
-var maybeMakePool = function () {
-  // We check MAIL_URL in case someone else set it in Meteor.startup code.
-  var poolFuture = new Future();
-  AppConfig.configurePackage('email', function (config) {
-    // TODO: allow reconfiguration.
-    if (!smtpPool && (config.url || process.env.MAIL_URL)) {
-      smtpPool = makePool(config.url || process.env.MAIL_URL);
-    }
-    poolFuture.return();
-  });
-
-  poolFuture.wait();
-};
+var getPool = _.once(function () {
+  // We delay this check until the first call to Email.send, in case someone
+  // set process.env.MAIL_URL in startup code.
+  var url = process.env.MAIL_URL;
+  if (! url)
+    return null;
+  return makePool(url);
+});
 
 var next_devmode_mail_id = 0;
 var output_stream = process.stdout;
@@ -64,13 +66,12 @@ EmailTest.restoreOutputStream = function () {
 var devModeSend = function (mc) {
   var devmode_mail_id = next_devmode_mail_id++;
 
-  // Make sure we use whatever stream was set at the time of the Email.send
-  // call even in the 'end' callback, in case there are multiple concurrent
-  // test runs.
   var stream = output_stream;
 
   // This approach does not prevent other writers to stdout from interleaving.
   stream.write("====== BEGIN MAIL #" + devmode_mail_id + " ======\n");
+  stream.write("(Mail not sent; to enable sending, set the MAIL_URL " +
+               "environment variable.)\n");
   mc.streamMessage();
   mc.pipe(stream, {end: false});
   var future = new Future;
@@ -81,8 +82,8 @@ var devModeSend = function (mc) {
   future.wait();
 };
 
-var smtpSend = function (mc) {
-  smtpPool._future_wrapped_sendMail(mc).wait();
+var smtpSend = function (pool, mc) {
+  pool._future_wrapped_sendMail(mc).wait();
 };
 
 /**
@@ -97,6 +98,7 @@ EmailTest.hookSend = function (f) {
   sendHooks.push(f);
 };
 
+// Old comment below
 /**
  * Send an email.
  *
@@ -116,35 +118,62 @@ EmailTest.hookSend = function (f) {
  * @param options.html {String} RFC5322 mail body (HTML)
  * @param options.headers {Object} custom RFC5322 headers (dictionary)
  */
+
+// New API doc comment below
+/**
+ * @summary Send an email. Throws an `Error` on failure to contact mail server
+ * or if mail server returns an error. All fields should match
+ * [RFC5322](http://tools.ietf.org/html/rfc5322) specification.
+ * @locus Server
+ * @param {Object} options
+ * @param {String} options.from "From:" address (required)
+ * @param {String|String[]} options.to,cc,bcc,replyTo
+ *   "To:", "Cc:", "Bcc:", and "Reply-To:" addresses
+ * @param {String} [options.subject]  "Subject:" line
+ * @param {String} [options.text|html] Mail body (in plain text and/or HTML)
+ * @param {Object} [options.headers] Dictionary of custom headers
+ * @param {Object[]} [options.attachments] Array of attachment objects, as
+ * described in the [mailcomposer documentation](https://github.com/andris9/mailcomposer#add-attachments).
+ * @param {MailComposer} [options.mailComposer] A [MailComposer](https://github.com/andris9/mailcomposer)
+ * object representing the message to be sent. Overrides all other options. You
+ * can access the `mailcomposer` npm module at
+ * `EmailInternals.NpmModules.mailcomposer.module`.
+ */
 Email.send = function (options) {
   for (var i = 0; i < sendHooks.length; i++)
     if (! sendHooks[i](options))
       return;
 
-  var mc = new MailComposer();
+  var mc;
+  if (options.mailComposer) {
+    mc = options.mailComposer;
+  } else {
+    mc = new MailComposer();
 
-  // setup message data
-  // XXX support attachments (once we have a client/server-compatible binary
-  //     Buffer class)
-  mc.setMessageOption({
-    from: options.from,
-    to: options.to,
-    cc: options.cc,
-    bcc: options.bcc,
-    replyTo: options.replyTo,
-    subject: options.subject,
-    text: options.text,
-    html: options.html
-  });
+    // setup message data
+    mc.setMessageOption({
+      from: options.from,
+      to: options.to,
+      cc: options.cc,
+      bcc: options.bcc,
+      replyTo: options.replyTo,
+      subject: options.subject,
+      text: options.text,
+      html: options.html
+    });
 
-  _.each(options.headers, function (value, name) {
-    mc.addHeader(name, value);
-  });
+    _.each(options.headers, function (value, name) {
+      mc.addHeader(name, value);
+    });
 
-  maybeMakePool();
+    _.each(options.attachments, function(attachment){
+      mc.addAttachment(attachment);
+    });
+  }
 
-  if (smtpPool) {
-    smtpSend(mc);
+  var pool = getPool();
+  if (pool) {
+    smtpSend(pool, mc);
   } else {
     devModeSend(mc);
   }

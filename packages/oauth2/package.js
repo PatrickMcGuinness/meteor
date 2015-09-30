@@ -1,17 +1,30 @@
 Package.describe({
   summary: "Common code for OAuth2-based login services",
-  internal: true
+  version: "1.1.5"
 });
 
-Package.on_use(function (api) {
-  api.use('service-configuration', ['client', 'server']);
-  api.use('oauth', ['client', 'server']);
+Package.onUse(function (api) {
+  api.use([
+    'random'
+  ], 'server');
 
-  api.add_files('oauth2_server.js', 'server');
+  api.use([
+    'oauth',
+    'service-configuration'
+  ], ['client', 'server']);
+
+  api.addFiles('oauth2_server.js', 'server');
 });
 
-Package.on_test(function (api) {
-  api.use(['tinytest', 'random', 'oauth2', 'oauth', 'service-configuration'],
-          'server');
-  api.add_files("oauth2_tests.js", 'server');
+Package.onTest(function (api) {
+  api.use([
+    'tinytest',
+    'random',
+    'oauth2',
+    'oauth',
+    'service-configuration',
+    'oauth-encryption'
+  ], 'server');
+
+  api.addFiles("oauth2_tests.js", 'server');
 });

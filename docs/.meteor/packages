@@ -3,13 +3,25 @@
 # 'meteor add' and 'meteor remove' will edit this file for you,
 # but you can also edit it by hand.
 
-standard-app-packages
+standard-minifiers
 jquery
 underscore
 showdown
-code-prettify
-jquery-waypoints
-less
 spiderable
 appcache
-handlebars
+reload-safetybelt
+simple:markdown-templating
+simple:highlight.js
+less
+meteor-base
+mobile-experience
+mongo
+blaze-html-templates
+session
+tracker
+logging
+reload
+random
+ejson
+spacebars
+check

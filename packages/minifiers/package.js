@@ -1,15 +1,33 @@
 Package.describe({
   summary: "JavaScript and CSS minifiers",
-  internal: true
+  version: "1.1.7"
 });
 
 Npm.depends({
-  "clean-css": "1.0.11",
-  // We depend on this commit, which has not been released yet.
-  "uglify-js": "https://github.com/mishoo/UglifyJS2/tarball/b1febde3e9be32b9d88918ed733efc3796e3f143"
+  "uglify-js": "2.4.20",
+  "css-parse": "2.0.0",
+  "css-stringify": "2.0.0"
 });
 
-Package.on_use(function (api) {
-  api.export(['CleanCSSProcess', 'UglifyJSMinify']);
-  api.add_files('minifiers.js', 'server');
+Npm.strip({
+  "uglify-js": ["test/"],
+  "css-parse": ["test/"],
+  "css-stringify": ["test/"]
+});
+
+Package.onUse(function (api) {
+  api.use('underscore', 'server');
+  api.export(['CssTools', 'UglifyJSMinify', 'UglifyJS']);
+  api.addFiles(['minification.js', 'minifiers.js'], 'server');
+});
+
+Package.onTest(function (api) {
+  api.use('minifiers', 'server');
+  api.use('tinytest');
+
+  api.addFiles([
+    'beautify-tests.js',
+    'minifiers-tests.js',
+    'urlrewriting-tests.js'
+  ], 'server');
 });

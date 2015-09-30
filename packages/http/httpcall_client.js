@@ -1,3 +1,21 @@
+/**
+ * @summary Perform an outbound HTTP request.
+ * @locus Anywhere
+ * @param {String} method The [HTTP method](http://en.wikipedia.org/wiki/HTTP_method) to use, such as "`GET`", "`POST`", or "`HEAD`".
+ * @param {String} url The URL to retrieve.
+ * @param {Object} [options]
+ * @param {String} options.content String to use as the HTTP request body.
+ * @param {Object} options.data JSON-able object to stringify and use as the HTTP request body. Overwrites `content`.
+ * @param {String} options.query Query string to go in the URL. Overwrites any query string in `url`.
+ * @param {Object} options.params Dictionary of request parameters to be encoded and placed in the URL (for GETs) or request body (for POSTs).  If `content` or `data` is specified, `params` will always be placed in the URL.
+ * @param {String} options.auth HTTP basic authentication string of the form `"username:password"`
+ * @param {Object} options.headers Dictionary of strings, headers to add to the HTTP request.
+ * @param {Number} options.timeout Maximum time in milliseconds to wait for the request before failing.  There is no timeout by default.
+ * @param {Boolean} options.followRedirects If `true`, transparently follow HTTP redirects. Cannot be set to `false` on the client. Default `true`.
+ * @param {Object} options.npmRequestOptions On the server, `HTTP.call` is implemented by using the [npm `request` module](https://www.npmjs.com/package/request). Any options in this object will be passed directly to the `request` invocation.
+ * @param {Function} options.beforeSend On the client, this will be called before the request is sent to allow for more direct manipulation of the underlying XMLHttpRequest object, which will be passed as the first argument. If the callback returns `false`, the request will be not be send.
+ * @param {Function} [asyncCallback] Optional callback.  If passed, the method runs asynchronously, instead of synchronously, and calls asyncCallback.  On the client, this callback is required.
+ */
 HTTP.call = function(method, url, options, callback) {
 
   ////////// Process arguments //////////
@@ -30,12 +48,14 @@ HTTP.call = function(method, url, options, callback) {
   else
     params_for_body = options.params;
 
-  var query_match = /^(.*?)(\?.*)?$/.exec(url);
-  url = buildUrl(query_match[1], query_match[2],
-                 options.query, params_for_url);
+  url = URL._constructUrl(url, options.query, params_for_url);
 
   if (options.followRedirects === false)
     throw new Error("Option followRedirects:false not supported on client.");
+
+  if (_.has(options, 'npmRequestOptions')) {
+    throw new Error("Option npmRequestOptions not supported on client.");
+  }
 
   var username, password;
   if (options.auth) {
@@ -47,7 +67,7 @@ HTTP.call = function(method, url, options, callback) {
   }
 
   if (params_for_body) {
-    content = encodeParams(params_for_body);
+    content = URL._encodeParams(params_for_body);
   }
 
   _.extend(headers, options.headers || {});
@@ -153,6 +173,17 @@ HTTP.call = function(method, url, options, callback) {
         }
       }
     };
+
+    // Allow custom control over XHR and abort early.
+    if (options.beforeSend) {
+      // Sanity
+      var beforeSend = _.once(options.beforeSend);
+
+      // Call the callback and check to see if the request was aborted
+      if (false === beforeSend.call(null, xhr, options)) {
+        return xhr.abort();
+      }
+    }
 
     // send it on its way
     xhr.send(content);

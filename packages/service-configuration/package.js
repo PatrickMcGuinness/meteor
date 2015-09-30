@@ -1,10 +1,12 @@
 Package.describe({
   summary: "Manage the configuration for third-party services",
-  internal: true
+  version: "1.0.5"
 });
 
-Package.on_use(function(api) {
-  api.use('mongo-livedata', ['client', 'server']);
+Package.onUse(function(api) {
+  api.use('accounts-base', ['client', 'server']);
+  api.use('mongo', ['client', 'server']);
   api.export('ServiceConfiguration');
-  api.add_files('service_configuration_common.js', ['client', 'server']);
+  api.addFiles('service_configuration_common.js', ['client', 'server']);
+  api.addFiles('service_configuration_server.js', 'server');
 });
